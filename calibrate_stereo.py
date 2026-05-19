@@ -98,7 +98,6 @@ def run_calibration(obj_points, img_pts_l, img_pts_r, img_size):
         flags=flags_stereo,
     )
 
-    baseline_m = abs(float(T[0])) / 1000.0 if abs(T[0]) > 0.01 else abs(float(T[0]))
     # T is in same units as SQUARE_SIZE_M (metres), so just take the magnitude
     baseline_m = float(np.linalg.norm(T))
 
@@ -111,7 +110,7 @@ def run_calibration(obj_points, img_pts_l, img_pts_r, img_size):
     print(f"  fx={fx:.2f}  fy={fy:.2f}  cx={cx:.2f}  cy={cy:.2f}")
     print(f"  Baseline: {baseline_m*1000:.2f} mm")
 
-    return dict(fx=fx, fy=fy, cx=cx, cy=cy, baseline=baseline_m,
+    return dict(fx=fx, fy=fy, cx=cx, cy=cy, baseline=baseline_m, rms=float(rms),
                 K_l=K_l, D_l=D_l, K_r=K_r, D_r=D_r, R=R, T=T)
 
 
@@ -203,6 +202,9 @@ def main():
                     fx=params["fx"], fy=params["fy"],
                     cx=params["cx"], cy=params["cy"],
                     baseline=params["baseline"],
+                    rms=params["rms"],
+                    image_width=img_size[0],
+                    image_height=img_size[1],
                     K_l=params["K_l"], D_l=params["D_l"],
                     K_r=params["K_r"], D_r=params["D_r"],
                     R=params["R"],    T=params["T"],

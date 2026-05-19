@@ -54,9 +54,25 @@ class CameraConfig:
     frame_width:  int = 2560  # Full side-by-side width from USB capture
     frame_height: int = 720   # Full frame height
 
+    # Full stereo calibration. These are required for rectification.
+    calibration_image_size: Optional[Tuple[int, int]] = None  # (eye_width, height)
+    K_l: Optional[np.ndarray] = None
+    D_l: Optional[np.ndarray] = None
+    K_r: Optional[np.ndarray] = None
+    D_r: Optional[np.ndarray] = None
+    R: Optional[np.ndarray] = None
+    T: Optional[np.ndarray] = None
+
     @property
     def eye_width(self) -> int:
         return self.frame_width // 2
+
+    @property
+    def has_full_calibration(self) -> bool:
+        return all(
+            v is not None
+            for v in (self.K_l, self.D_l, self.K_r, self.D_r, self.R, self.T)
+        )
 
 
 # ── Tennis ball HSV colour range ──────────────────────────────────────────────
@@ -69,6 +85,9 @@ MIN_RADIUS_PX = 8    # Ignore circles smaller than this (noise)
 MAX_RADIUS_PX = 150  # Ignore circles larger than this
 
 TENNIS_BALL_RADIUS_M = 0.0335   # Physical radius ≈ 33.5 mm (ITF standard)
+
+# Rectified stereo pairs should have almost the same y coordinate.
+MAX_EPIPOLAR_Y_DIFF_PX = 4.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -106,8 +125,9 @@ class ZEDCamera:
         # Update config to match what the camera actually gave us
         self.cfg.frame_width  = actual_w
         self.cfg.frame_height = actual_h
-        self.cfg.cx = actual_w // 4   # cx for each eye ≈ eye_width / 2
-        self.cfg.cy = actual_h // 2
+        if not self.cfg.has_full_calibration:
+            self.cfg.cx = actual_w // 4   # cx for each eye ≈ eye_width / 2
+            self.cfg.cy = actual_h // 2
 
     def read(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         """Return (left, right) BGR frames, or (None, None) on error."""
@@ -184,8 +204,119 @@ class TennisBallDetector:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  TRIANGULATOR
+#  RECTIFICATION + TRIANGULATION
 # ══════════════════════════════════════════════════════════════════════════════
+
+class StereoRectifier:
+    """
+    Rectifies raw ZED UVC eye images so same-world points lie on the same row.
+    Without this step, simple x-disparity triangulation is not reliable.
+    """
+
+    def __init__(self, config: CameraConfig):
+        self.cfg = config
+        self.enabled = False
+        self._maps_l = None
+        self._maps_r = None
+
+        if not config.has_full_calibration:
+            print("[Rectification] No full calibration matrices found; using raw frames.")
+            return
+
+        image_size = (config.eye_width, config.frame_height)
+        K_l, K_r = self._scaled_intrinsics(image_size)
+
+        R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(
+            K_l,
+            config.D_l,
+            K_r,
+            config.D_r,
+            image_size,
+            config.R,
+            config.T,
+            flags=cv2.CALIB_ZERO_DISPARITY,
+            alpha=0,
+        )
+
+        self._maps_l = cv2.initUndistortRectifyMap(
+            K_l, config.D_l, R1, P1, image_size, cv2.CV_16SC2
+        )
+        self._maps_r = cv2.initUndistortRectifyMap(
+            K_r, config.D_r, R2, P2, image_size, cv2.CV_16SC2
+        )
+
+        config.fx = float(P1[0, 0])
+        config.fy = float(P1[1, 1])
+        config.cx = float(P1[0, 2])
+        config.cy = float(P1[1, 2])
+        config.baseline = abs(float(P2[0, 3]) / config.fx)
+
+        self.enabled = True
+        print("[Rectification] Enabled.")
+        print(
+            f"  Rectified fx={config.fx:.1f} fy={config.fy:.1f} "
+            f"cx={config.cx:.1f} cy={config.cy:.1f} B={config.baseline*1000:.1f} mm"
+        )
+
+    def _scaled_intrinsics(self, image_size: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray]:
+        if self.cfg.calibration_image_size is None:
+            return self.cfg.K_l.copy(), self.cfg.K_r.copy()
+
+        cal_w, cal_h = self.cfg.calibration_image_size
+        cur_w, cur_h = image_size
+        sx = cur_w / cal_w
+        sy = cur_h / cal_h
+
+        def scale(K: np.ndarray) -> np.ndarray:
+            K2 = K.copy()
+            K2[0, 0] *= sx
+            K2[0, 2] *= sx
+            K2[1, 1] *= sy
+            K2[1, 2] *= sy
+            return K2
+
+        if abs(sx - 1.0) > 0.001 or abs(sy - 1.0) > 0.001:
+            print(
+                "[Rectification] Scaling calibration intrinsics from "
+                f"{cal_w}x{cal_h} to {cur_w}x{cur_h}."
+            )
+
+        return scale(self.cfg.K_l), scale(self.cfg.K_r)
+
+    def rectify(self, left: np.ndarray, right: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        if not self.enabled:
+            return left, right
+
+        left_rect = cv2.remap(left, self._maps_l[0], self._maps_l[1], cv2.INTER_LINEAR)
+        right_rect = cv2.remap(right, self._maps_r[0], self._maps_r[1], cv2.INTER_LINEAR)
+        return left_rect, right_rect
+
+
+def validate_stereo_pair(left: Detection, right: Detection,
+                         max_y_diff: float = MAX_EPIPOLAR_Y_DIFF_PX) -> Tuple[bool, str]:
+    if left is None or right is None:
+        missing = []
+        if left is None:
+            missing.append("LEFT")
+        if right is None:
+            missing.append("RIGHT")
+        return False, "Ball not detected in " + " ".join(missing)
+
+    xl, yl, rl = left
+    xr, yr, rr = right
+    y_diff = abs(float(yl - yr))
+    if y_diff > max_y_diff:
+        return False, f"Rejected pair: epipolar y-diff {y_diff:.1f}px > {max_y_diff:.1f}px"
+
+    disparity = float(xl - xr)
+    if disparity <= 1.0:
+        return False, f"Rejected pair: invalid disparity {disparity:.1f}px"
+
+    radius_ratio = min(rl, rr) / max(rl, rr)
+    if radius_ratio < 0.65:
+        return False, f"Rejected pair: radius mismatch L={rl}px R={rr}px"
+
+    return True, "OK"
 
 @dataclass
 class BallPosition:
@@ -194,15 +325,34 @@ class BallPosition:
     Z: float          # metres, positive = forward
     disparity: float  # pixels (diagnostic)
     size_Z: float     # metres, depth estimated from apparent ball size (cross-check)
+    epipolar_y_diff: float  # pixels (diagnostic after rectification)
+    known_Z: Optional[float] = None
+    depth_error: Optional[float] = None
+    depth_error_pct: Optional[float] = None
 
     def __str__(self):
-        return (f"X={self.X:+.3f} m  Y={self.Y:+.3f} m  Z={self.Z:.3f} m  "
-                f"(disp={self.disparity:.1f} px | size_Z={self.size_Z:.3f} m)")
+        msg = (f"X={self.X:+.3f} m  Y={self.Y:+.3f} m  Z={self.Z:.3f} m  "
+               f"(disp={self.disparity:.1f} px | ydiff={self.epipolar_y_diff:.1f} px "
+               f"| size_Z={self.size_Z:.3f} m)")
+        if self.depth_error is not None and self.depth_error_pct is not None:
+            msg += (f" | known_Z={self.known_Z:.3f} m "
+                    f"err={self.depth_error:+.3f} m ({self.depth_error_pct:+.1f}%)")
+        return msg
 
     def to_dict(self):
-        return {"X": round(self.X, 4), "Y": round(self.Y, 4),
-                "Z": round(self.Z, 4), "disparity": round(self.disparity, 2),
-                "size_Z": round(self.size_Z, 4)}
+        record = {
+            "X": round(self.X, 4),
+            "Y": round(self.Y, 4),
+            "Z": round(self.Z, 4),
+            "disparity": round(self.disparity, 2),
+            "size_Z": round(self.size_Z, 4),
+            "epipolar_y_diff": round(self.epipolar_y_diff, 2),
+        }
+        if self.known_Z is not None:
+            record["known_Z"] = round(self.known_Z, 4)
+            record["depth_error"] = round(self.depth_error, 4)
+            record["depth_error_pct"] = round(self.depth_error_pct, 2)
+        return record
 
 
 class StereoTriangulator:
@@ -224,12 +374,13 @@ class StereoTriangulator:
     def __init__(self, config: CameraConfig = CameraConfig()):
         self.cfg = config
 
-    def triangulate(self, left: Detection, right: Detection) -> Optional[BallPosition]:
+    def triangulate(self, left: Detection, right: Detection,
+                    known_depth_m: Optional[float] = None) -> Optional[BallPosition]:
         if left is None or right is None:
             return None
 
         xl, yl, rl = left
-        xr, yr, _  = right
+        xr, yr, rr = right
 
         disparity = float(xl - xr)
         if disparity <= 1.0:
@@ -240,9 +391,29 @@ class StereoTriangulator:
         X = (xl - self.cfg.cx) * Z / self.cfg.fx
         Y = (yl - self.cfg.cy) * Z / self.cfg.fy
 
-        size_Z = (self.cfg.fx * TENNIS_BALL_RADIUS_M) / max(rl, 1)
+        avg_radius_px = max((rl + rr) / 2.0, 1.0)
+        size_Z = (self.cfg.fx * TENNIS_BALL_RADIUS_M) / avg_radius_px
+        epipolar_y_diff = abs(float(yl - yr))
 
-        return BallPosition(X=X, Y=Y, Z=Z, disparity=disparity, size_Z=size_Z)
+        depth_error = None
+        depth_error_pct = None
+        known_Z = None
+        if known_depth_m is not None and known_depth_m > 0:
+            known_Z = known_depth_m
+            depth_error = Z - known_depth_m
+            depth_error_pct = (depth_error / known_depth_m) * 100.0
+
+        return BallPosition(
+            X=X,
+            Y=Y,
+            Z=Z,
+            disparity=disparity,
+            size_Z=size_Z,
+            epipolar_y_diff=epipolar_y_diff,
+            known_Z=known_Z,
+            depth_error=depth_error,
+            depth_error_pct=depth_error_pct,
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -252,7 +423,8 @@ class StereoTriangulator:
 def load_calibration(path: str, config: CameraConfig) -> CameraConfig:
     """
     Load stereo calibration saved by calibrate_stereo.py and update config.
-    File format: NumPy .npz with keys  fx, fy, cx, cy, baseline
+    File format: NumPy .npz with keys  fx, fy, cx, cy, baseline,
+    K_l, D_l, K_r, D_r, R, T, and optional image_width/image_height.
     """
     data = np.load(path)
     config.fx       = float(data["fx"])
@@ -260,6 +432,25 @@ def load_calibration(path: str, config: CameraConfig) -> CameraConfig:
     config.cx       = float(data["cx"])
     config.cy       = float(data["cy"])
     config.baseline = float(data["baseline"])
+
+    required = ("K_l", "D_l", "K_r", "D_r", "R", "T")
+    if all(k in data for k in required):
+        config.K_l = data["K_l"]
+        config.D_l = data["D_l"]
+        config.K_r = data["K_r"]
+        config.D_r = data["D_r"]
+        config.R = data["R"]
+        config.T = data["T"]
+        if "image_width" in data and "image_height" in data:
+            config.calibration_image_size = (
+                int(data["image_width"]),
+                int(data["image_height"]),
+            )
+        config.baseline = abs(float(config.T[0]))
+    else:
+        missing = ", ".join(k for k in required if k not in data)
+        print(f"[Calibration] Warning: missing {missing}; rectification disabled.")
+
     print(f"[Calibration] Loaded from {path}")
     print(f"  fx={config.fx:.1f}  fy={config.fy:.1f}  "
           f"cx={config.cx:.1f}  cy={config.cy:.1f}  B={config.baseline*1000:.1f} mm")
@@ -271,7 +462,7 @@ def load_calibration(path: str, config: CameraConfig) -> CameraConfig:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def overlay_info(frame: np.ndarray, pos: Optional[BallPosition],
-                 fps: float, left_det: Detection, right_det: Detection):
+                 fps: float, status_message: str):
     h, w = frame.shape[:2]
 
     # Status bar background
@@ -279,13 +470,12 @@ def overlay_info(frame: np.ndarray, pos: Optional[BallPosition],
 
     if pos:
         txt = f"X:{pos.X:+.3f}m  Y:{pos.Y:+.3f}m  Z:{pos.Z:.3f}m  disp:{pos.disparity:.1f}px"
+        if pos.depth_error is not None:
+            txt += f"  err:{pos.depth_error:+.3f}m"
         cv2.putText(frame, txt, (10, 22),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 255, 80), 2)
     else:
-        reason = "Ball not detected in "
-        reason += "LEFT " if left_det  is None else ""
-        reason += "RIGHT" if right_det is None else ""
-        cv2.putText(frame, reason, (10, 22),
+        cv2.putText(frame, status_message[:100], (10, 22),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 80, 255), 2)
 
     cv2.putText(frame, f"FPS: {fps:.1f}", (10, 50),
@@ -313,11 +503,17 @@ def parse_args():
                    help="Disable OpenCV window (use for headless SSH sessions)")
     p.add_argument("--log",         type=str,   default=None,
                    help="Append JSON position records to this file")
+    p.add_argument("--known-distance", type=float, default=None,
+                   help="Known measured ball distance in metres for depth-error checks")
+    p.add_argument("--max-epipolar-y-diff", type=float, default=MAX_EPIPOLAR_Y_DIFF_PX,
+                   help="Reject left/right matches with larger rectified y difference")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.known_distance is not None and args.known_distance <= 0:
+        raise ValueError("--known-distance must be a positive distance in metres")
 
     # ── Setup ──────────────────────────────────────────────────────────────
     config = CameraConfig()
@@ -325,6 +521,7 @@ def main():
         config = load_calibration(args.calibration, config)
 
     camera       = ZEDCamera(device_id=args.device, config=config)
+    rectifier    = StereoRectifier(camera.cfg)
     detector     = TennisBallDetector()
     triangulator = StereoTriangulator(config=camera.cfg)  # use updated config
 
@@ -336,6 +533,8 @@ def main():
     frame_idx  = 0
 
     print("\n[Ready] Press 'q' to quit, 's' to save current frame.\n")
+    if args.known_distance is not None:
+        print(f"[Depth Check] Comparing Z against known distance {args.known_distance:.3f} m")
 
     while True:
         left, right = camera.read()
@@ -344,20 +543,43 @@ def main():
             time.sleep(0.1)
             continue
 
+        left, right = rectifier.rectify(left, right)
+
         # ── Detect ──────────────────────────────────────────────────────
         left_det  = detector.detect(left)
         right_det = detector.detect(right)
 
+        pair_ok, status_message = validate_stereo_pair(
+            left_det,
+            right_det,
+            max_y_diff=args.max_epipolar_y_diff,
+        )
+
         # ── Triangulate ─────────────────────────────────────────────────
-        position = triangulator.triangulate(left_det, right_det)
+        position = (
+            triangulator.triangulate(
+                left_det,
+                right_det,
+                known_depth_m=args.known_distance,
+            )
+            if pair_ok else None
+        )
 
         # ── Log / print ─────────────────────────────────────────────────
         if position:
             print(f"[Frame {frame_idx:05d}] {position}")
             if log_file:
-                record = {"frame": frame_idx, "t": time.time(), **position.to_dict()}
+                record = {
+                    "frame": frame_idx,
+                    "t": time.time(),
+                    "rectified": rectifier.enabled,
+                    "status": status_message,
+                    **position.to_dict(),
+                }
                 log_file.write(json.dumps(record) + "\n")
                 log_file.flush()
+        elif frame_idx % 30 == 0:
+            print(f"[Frame {frame_idx:05d}] {status_message}")
 
         # ── FPS ─────────────────────────────────────────────────────────
         frame_idx += 1
@@ -374,7 +596,7 @@ def main():
             # Combine side by side and downscale for Pi's display
             combined = np.hstack([left, right])
             combined = cv2.resize(combined, (1280, 360))
-            overlay_info(combined, position, fps, left_det, right_det)
+            overlay_info(combined, position, fps, status_message)
 
             cv2.imshow("ZED Ball Detection", combined)
             key = cv2.waitKey(1) & 0xFF
