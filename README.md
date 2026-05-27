@@ -14,14 +14,36 @@ The code now supports full stereo calibration handling. If `calibration.npz` inc
 
 The current local Python compile check passes:
 
-```powershell
-python -m py_compile ball_detection.py calibrate_stereo.py tune_hsv.py
+```bash
+python3 -m py_compile ball_detection.py calibrate_stereo.py tune_hsv.py
 ```
 
-Runtime still requires OpenCV and NumPy:
+## Ubuntu / Raspberry Pi 5 Setup
 
-```powershell
-pip install opencv-python numpy
+On Ubuntu Desktop for Raspberry Pi 5, use the Ubuntu OpenCV packages instead of `pip install opencv-python`. The system packages are built for ARM and include the OpenCV GUI support used by the calibration and HSV tuning windows.
+
+```bash
+sudo apt update
+sudo apt install python3-opencv python3-numpy v4l-utils
+```
+
+Verify Python can import OpenCV:
+
+```bash
+python3 -c "import cv2, numpy; print(cv2.__version__)"
+```
+
+The ZED appears as one or more `/dev/video*` devices. Find the correct node and supported formats with:
+
+```bash
+v4l2-ctl --list-devices
+v4l2-ctl -d /dev/video0 --list-formats-ext
+```
+
+If the camera opens only with `sudo` or fails with a permission error, add your user to the `video` group, then log out and back in:
+
+```bash
+sudo usermod -aG video "$USER"
 ```
 
 ## Hardware Assumptions
@@ -84,9 +106,18 @@ Print or display a checkerboard with known square size. The current default is:
 
 Run:
 
-```powershell
-python calibrate_stereo.py
+```bash
+python3 calibrate_stereo.py --device 0
 ```
+
+The default capture request is `2560x720 @ 30fps`, which is the full side-by-side stereo frame for two `1280x720` eyes. If the camera requires MJPEG or the Pi needs a lighter stream, pass capture options explicitly:
+
+```bash
+python3 calibrate_stereo.py --device 0 --width 2560 --height 720 --fps 30 --fourcc MJPG
+python3 calibrate_stereo.py --device 0 --width 1280 --height 360 --fps 15 --fourcc MJPG
+```
+
+For best accuracy, calibrate at the same resolution you plan to use for detection.
 
 Controls:
 
@@ -102,49 +133,56 @@ calibration.npz
 
 Use it with:
 
-```powershell
-python ball_detection.py --calibration calibration.npz
+```bash
+python3 ball_detection.py --device 0 --calibration calibration.npz
 ```
 
 ## Running Ball Detection
 
 Basic run:
 
-```powershell
-python ball_detection.py
+```bash
+python3 ball_detection.py --device 0
 ```
 
 Recommended calibrated run:
 
-```powershell
-python ball_detection.py --calibration calibration.npz
+```bash
+python3 ball_detection.py --device 0 --calibration calibration.npz
 ```
 
 Headless run over SSH:
 
-```powershell
-python ball_detection.py --calibration calibration.npz --no-display
+```bash
+python3 ball_detection.py --device 0 --calibration calibration.npz --no-display
 ```
 
 Log detections as JSON lines:
 
-```powershell
-python ball_detection.py --calibration calibration.npz --log positions.jsonl
+```bash
+python3 ball_detection.py --device 0 --calibration calibration.npz --log positions.jsonl
 ```
 
 Compare computed depth against a measured test distance:
 
-```powershell
-python ball_detection.py --calibration calibration.npz --known-distance 1.0
+```bash
+python3 ball_detection.py --device 0 --calibration calibration.npz --known-distance 1.0
 ```
 
 Tune the HSV color range:
 
-```powershell
-python tune_hsv.py
+```bash
+python3 tune_hsv.py --device 0
 ```
 
 Press `s` in the tuner to print updated `HSV_LOWER` and `HSV_UPPER` values, then copy those values into `ball_detection.py`.
+
+If the Pi cannot keep up at the default capture size, reduce the capture request:
+
+```bash
+python3 ball_detection.py --device 0 --width 1280 --height 360 --fps 15 --calibration calibration.npz
+python3 tune_hsv.py --device 0 --width 1280 --height 360 --fps 15 --fourcc MJPG
+```
 
 ## Coordinate Frame
 

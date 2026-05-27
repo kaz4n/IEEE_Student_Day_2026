@@ -11,12 +11,13 @@ Coordinate frame (camera-centered):
   +Z → forward (away from camera)
 
 Requirements:
-  pip install opencv-python numpy
+  sudo apt install python3-opencv python3-numpy v4l-utils
 
 Usage:
-  python ball_detection.py
-  python ball_detection.py --calibration my_calibration.npz
-  python ball_detection.py --no-display      (headless / SSH mode)
+  python3 ball_detection.py
+  python3 ball_detection.py --calibration my_calibration.npz
+  python3 ball_detection.py --no-display      (headless / SSH mode)
+  python3 ball_detection.py --width 1280 --height 360 --fps 15
 """
 
 import cv2
@@ -53,6 +54,8 @@ class CameraConfig:
     # ── Frame geometry ────────────────────────────────────────────────────────
     frame_width:  int = 2560  # Full side-by-side width from USB capture
     frame_height: int = 720   # Full frame height
+    fps: float = 30.0
+    fourcc: Optional[str] = None
 
     # Full stereo calibration. These are required for rectification.
     calibration_image_size: Optional[Tuple[int, int]] = None  # (eye_width, height)
@@ -94,6 +97,31 @@ MAX_EPIPOLAR_Y_DIFF_PX = 4.0
 #  CAMERA LAYER
 # ══════════════════════════════════════════════════════════════════════════════
 
+def fourcc_to_string(value: float) -> str:
+    code = int(value)
+    chars = [chr((code >> 8 * i) & 0xFF) for i in range(4)]
+    text = "".join(chars)
+    return text if text.strip("\x00") else "unknown"
+
+
+def camera_open_error(device_id: int) -> str:
+    if sys.platform.startswith("win"):
+        return (
+            f"Cannot open camera at device {device_id}. "
+            "Check the USB connection and camera permissions."
+        )
+
+    device_path = f"/dev/video{device_id}"
+    return (
+        f"Cannot open camera at device {device_id} ({device_path}). "
+        "Check the USB connection, verify the correct node with "
+        "`v4l2-ctl --list-devices`, inspect formats with "
+        f"`v4l2-ctl -d {device_path} --list-formats-ext`, and make sure your "
+        "user is in the video group with `sudo usermod -aG video \"$USER\"` "
+        "then log out and back in."
+    )
+
+
 class ZEDCamera:
     """
     Opens the ZED as a standard USB UVC device and splits each frame into
@@ -105,22 +133,29 @@ class ZEDCamera:
         backend = cv2.CAP_DSHOW if sys.platform.startswith("win") else cv2.CAP_V4L2
         self.cap = cv2.VideoCapture(device_id, backend)
 
+        if config.fourcc:
+            fourcc = config.fourcc.upper()
+            if len(fourcc) != 4:
+                raise ValueError("--fourcc must be exactly four characters, such as MJPG")
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  config.frame_width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.frame_height)
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
+        self.cap.set(cv2.CAP_PROP_FPS, config.fps)
         # Disable auto-exposure to keep colour stable
         self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
 
         if not self.cap.isOpened():
-            raise RuntimeError(
-                f"Cannot open camera at device {device_id}. "
-                "Check USB connection and camera permissions."
-            )
+            raise RuntimeError(camera_open_error(device_id))
 
         actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        print(f"[ZED] Opened at {actual_w}×{actual_h} "
-              f"(eye: {actual_w // 2}×{actual_h})")
+        actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        actual_fourcc = fourcc_to_string(self.cap.get(cv2.CAP_PROP_FOURCC))
+        print(
+            f"[ZED] Opened at {actual_w}×{actual_h} "
+            f"(eye: {actual_w // 2}×{actual_h}) "
+            f"fps={actual_fps:.1f} fourcc={actual_fourcc}"
+        )
 
         # Update config to match what the camera actually gave us
         self.cfg.frame_width  = actual_w
@@ -497,6 +532,14 @@ def parse_args():
     p = argparse.ArgumentParser(description="Tennis ball 3D detection via ZED stereo")
     p.add_argument("--device",      type=int,   default=0,
                    help="V4L2 device index (default 0 → /dev/video0)")
+    p.add_argument("--width",       type=int,   default=2560,
+                   help="Requested full side-by-side capture width (default 2560)")
+    p.add_argument("--height",      type=int,   default=720,
+                   help="Requested capture height (default 720)")
+    p.add_argument("--fps",         type=float, default=30.0,
+                   help="Requested camera frame rate (default 30)")
+    p.add_argument("--fourcc",      type=str,   default=None,
+                   help="Optional four-character pixel format request, such as MJPG")
     p.add_argument("--calibration", type=str,   default=None,
                    help="Path to .npz calibration file from calibrate_stereo.py")
     p.add_argument("--no-display",  action="store_true",
@@ -512,11 +555,22 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.width <= 0 or args.height <= 0:
+        raise ValueError("--width and --height must be positive")
+    if args.width % 2 != 0:
+        raise ValueError("--width must be even because the stereo frame is split in half")
+    if args.fps <= 0:
+        raise ValueError("--fps must be positive")
     if args.known_distance is not None and args.known_distance <= 0:
         raise ValueError("--known-distance must be a positive distance in metres")
 
     # ── Setup ──────────────────────────────────────────────────────────────
-    config = CameraConfig()
+    config = CameraConfig(
+        frame_width=args.width,
+        frame_height=args.height,
+        fps=args.fps,
+        fourcc=args.fourcc,
+    )
     if args.calibration:
         config = load_calibration(args.calibration, config)
 

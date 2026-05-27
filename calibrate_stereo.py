@@ -9,13 +9,13 @@ Output: calibration.npz  — loaded by ball_detection.py via --calibration flag
 Steps
 -----
 1. Print or display a checkerboard (default: 9×6 inner corners, 25 mm squares)
-2. Run this script:  python calibrate_stereo.py
+2. Run this script:  python3 calibrate_stereo.py
 3. Hold the checkerboard in ~20 different positions/angles in front of the camera
 4. Press SPACE to capture each pose  (need at least 15 good captures)
 5. Press 'c' when done collecting to run calibration
 6. Results saved to calibration.npz
 
-Requirements: pip install opencv-python numpy
+Requirements: sudo apt install python3-opencv python3-numpy v4l-utils
 """
 
 import cv2
@@ -23,7 +23,7 @@ import numpy as np
 import sys
 import time
 import argparse
-from pathlib import Path
+from typing import Optional
 
 # ── Checkerboard configuration ────────────────────────────────────────────────
 # Inner corners (columns - 1, rows - 1) of your printed checkerboard
@@ -37,17 +37,56 @@ OUTPUT_FILE   = "calibration.npz"
 DEVICE_ID     = 0
 FRAME_W       = 2560    # Full side-by-side width
 FRAME_H       = 720
+FPS           = 30.0
 
 
-def open_camera(device_id: int):
+def fourcc_to_string(value: float) -> str:
+    code = int(value)
+    chars = [chr((code >> 8 * i) & 0xFF) for i in range(4)]
+    text = "".join(chars)
+    return text if text.strip("\x00") else "unknown"
+
+
+def camera_open_error(device_id: int) -> str:
+    if sys.platform.startswith("win"):
+        return "ERROR: Cannot open camera. Check USB connection and camera permissions."
+
+    device_path = f"/dev/video{device_id}"
+    return (
+        f"ERROR: Cannot open camera at {device_path}.\n"
+        "Check the USB connection and find the ZED node with:\n"
+        "  v4l2-ctl --list-devices\n"
+        "Inspect supported formats with:\n"
+        f"  v4l2-ctl -d {device_path} --list-formats-ext\n"
+        "If permissions fail, add your user to the video group, then log out/in:\n"
+        "  sudo usermod -aG video \"$USER\""
+    )
+
+
+def open_camera(device_id: int, width: int, height: int, fps: float,
+                fourcc: Optional[str]):
     backend = cv2.CAP_DSHOW if sys.platform.startswith("win") else cv2.CAP_V4L2
     cap = cv2.VideoCapture(device_id, backend)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_W)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
-    cap.set(cv2.CAP_PROP_FPS, 30)
+    if fourcc:
+        fourcc = fourcc.upper()
+        if len(fourcc) != 4:
+            raise ValueError("--fourcc must be exactly four characters, such as MJPG")
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    cap.set(cv2.CAP_PROP_FPS, fps)
     if not cap.isOpened():
-        print("ERROR: Cannot open camera.")
+        print(camera_open_error(device_id))
         sys.exit(1)
+    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    actual_fps = cap.get(cv2.CAP_PROP_FPS)
+    actual_fourcc = fourcc_to_string(cap.get(cv2.CAP_PROP_FOURCC))
+    print(
+        f"[ZED] Opened at {actual_w}×{actual_h} "
+        f"(eye: {actual_w // 2}×{actual_h}) "
+        f"fps={actual_fps:.1f} fourcc={actual_fourcc}"
+    )
     return cap
 
 
@@ -55,6 +94,14 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Stereo calibration for ZED")
     parser.add_argument("--device", type=int, default=DEVICE_ID,
                         help="Camera index (default 0)")
+    parser.add_argument("--width", type=int, default=FRAME_W,
+                        help="Requested full side-by-side capture width (default 2560)")
+    parser.add_argument("--height", type=int, default=FRAME_H,
+                        help="Requested capture height (default 720)")
+    parser.add_argument("--fps", type=float, default=FPS,
+                        help="Requested camera frame rate (default 30)")
+    parser.add_argument("--fourcc", type=str, default=None,
+                        help="Optional four-character pixel format request, such as MJPG")
     return parser.parse_args()
 
 
@@ -116,6 +163,12 @@ def run_calibration(obj_points, img_pts_l, img_pts_r, img_size):
 
 def main():
     args = parse_args()
+    if args.width <= 0 or args.height <= 0:
+        raise ValueError("--width and --height must be positive")
+    if args.width % 2 != 0:
+        raise ValueError("--width must be even because the stereo frame is split in half")
+    if args.fps <= 0:
+        raise ValueError("--fps must be positive")
     board_size = (BOARD_W, BOARD_H)
 
     # 3-D object points for one checkerboard pose
@@ -126,7 +179,7 @@ def main():
     img_pts_l   = []   # 2-D points in left eye
     img_pts_r   = []   # 2-D points in right eye
 
-    cap        = open_camera(args.device)
+    cap        = open_camera(args.device, args.width, args.height, args.fps, args.fourcc)
     n_captures = 0
 
     print(f"\nCheckerboard: {BOARD_W}×{BOARD_H} inner corners, {SQUARE_SIZE_M*1000:.0f} mm squares")
@@ -210,7 +263,10 @@ def main():
                     R=params["R"],    T=params["T"],
                 )
                 print(f"\n[Saved] {OUTPUT_FILE}")
-                print(f"Run detection with:  python ball_detection.py --calibration {OUTPUT_FILE}")
+                print(
+                    f"Run detection with:  python3 ball_detection.py "
+                    f"--device {args.device} --calibration {OUTPUT_FILE}"
+                )
                 break
 
     cap.release()
