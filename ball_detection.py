@@ -27,6 +27,7 @@ import time
 import json
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Tuple
 
 
@@ -90,7 +91,7 @@ MAX_RADIUS_PX = 150  # Ignore circles larger than this
 TENNIS_BALL_RADIUS_M = 0.0335   # Physical radius ≈ 33.5 mm (ITF standard)
 
 # Rectified stereo pairs should have almost the same y coordinate.
-MAX_EPIPOLAR_Y_DIFF_PX = 4.0
+MAX_EPIPOLAR_Y_DIFF_PX = 10.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -461,6 +462,17 @@ def load_calibration(path: str, config: CameraConfig) -> CameraConfig:
     File format: NumPy .npz with keys  fx, fy, cx, cy, baseline,
     K_l, D_l, K_r, D_r, R, T, and optional image_width/image_height.
     """
+    calibration_path = Path(path)
+    if not calibration_path.exists():
+        raise FileNotFoundError(
+            f"Calibration file not found: {calibration_path}\n"
+            "Create it first with:\n"
+            "  python3 calibrate_stereo.py --device 0\n"
+            "Then run detection with:\n"
+            "  python3 ball_detection.py --device 0 --calibration calibration.npz\n"
+            "For an uncalibrated quick camera test, omit the --calibration option."
+        )
+
     data = np.load(path)
     config.fx       = float(data["fx"])
     config.fy       = float(data["fy"])
