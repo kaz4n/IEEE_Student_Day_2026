@@ -59,7 +59,7 @@ If the camera negotiates a different resolution, the code reads the actual captu
 
 - Opens the ZED as a normal OpenCV `VideoCapture` device.
 - Splits each frame into left and right eye images.
-- Detects the tennis ball using HSV color masking and Hough circle detection.
+- Detects the tennis ball using a model-first hybrid detector: optional ONNX object detection, OpenCV color/shape fallback, and Kalman tracking.
 - Loads stereo calibration from `calibration.npz`.
 - Rectifies both camera images before triangulation when full calibration data is available.
 - Validates left/right detections before accepting a 3D result.
@@ -75,17 +75,17 @@ If the camera negotiates a different resolution, the code reads the actual captu
 1. `ball_detection.py` opens the ZED camera and requests a side-by-side stereo frame.
 2. The frame is split into left and right images.
 3. If a full calibration file is provided, both images are undistorted and rectified with OpenCV stereo rectification.
-4. Each rectified image is converted to HSV.
-5. A yellow-green HSV mask isolates likely tennis-ball pixels.
-6. Morphological cleanup and Gaussian blur reduce noise.
-7. Hough circle detection finds candidate circular blobs.
-8. The largest detected circle is selected in each eye.
+4. Each rectified image is searched by the hybrid detector.
+5. If `models/tennis_ball.onnx` exists, a lightweight YOLO-style ONNX model proposes ball boxes.
+6. The OpenCV fallback proposes color/shape candidates for debugging and backup.
+7. Per-eye Kalman trackers predict the likely search area and bridge short misses.
+8. Candidate stereo pairs are scored by confidence, epipolar alignment, disparity, radius consistency, and depth-vs-size agreement.
 9. The pair is rejected if:
    - either eye has no detection,
    - the rectified y coordinates differ too much,
    - disparity is invalid or too small,
    - the detected ball radii are very different.
-10. If the pair is valid, stereo disparity is used:
+10. If the pair is valid, stereo disparity is used and the 3D output is smoothed by a constant-velocity tracker:
 
 ```text
 disparity = x_left - x_right
@@ -176,6 +176,14 @@ python3 tune_hsv.py --device 0
 ```
 
 Press `s` in the tuner to print updated `HSV_LOWER` and `HSV_UPPER` values, then copy those values into `ball_detection.py`.
+
+Hybrid detector controls:
+
+```bash
+python3 ball_detection.py --device 0 --calibration calibration.npz --detector hybrid --model models/tennis_ball.onnx
+python3 ball_detection.py --device 0 --calibration calibration.npz --detector opencv --debug-mask
+python3 ball_detection.py --device 0 --calibration calibration.npz --exposure -6 --gain 0
+```
 
 If the Pi cannot keep up at the default capture size, reduce the capture request:
 

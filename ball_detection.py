@@ -2,8 +2,8 @@
 Tennis Ball 3D Detection — ZED Stereo Camera on Raspberry Pi
 ============================================================
 Uses the ZED as a standard USB stereo camera (no ZED SDK / CUDA needed).
-Detects tennis ball via HSV color filtering + Hough circles in both eyes,
-then triangulates to get real-world (X, Y, Z) coordinates in meters.
+Detects a tennis ball with a model-first hybrid detector plus OpenCV fallback,
+then tracks and triangulates real-world (X, Y, Z) coordinates in meters.
 
 Coordinate frame (camera-centered):
   +X → right
@@ -29,7 +29,7 @@ import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -56,6 +56,10 @@ class CameraConfig:
     # ── Frame geometry ────────────────────────────────────────────────────────
     frame_width:  int = 2560  # Full side-by-side width from USB capture
     frame_height: int = 720   # Full frame height
+    fps: float = 30.0
+    fourcc: Optional[str] = "MJPG"
+    exposure: Optional[float] = None
+    gain: Optional[float] = None
 
     # Full stereo calibration. These are required for rectification.
     calibration_image_size: Optional[Tuple[int, int]] = None  # (eye_width, height)
@@ -83,9 +87,11 @@ class CameraConfig:
 HSV_LOWER = np.array([22,  80,  80])
 HSV_UPPER = np.array([65, 255, 255])
 
-# ── Hough / geometry limits ───────────────────────────────────────────────────
-MIN_RADIUS_PX = 8    # Ignore circles smaller than this (noise)
-MAX_RADIUS_PX = 150  # Ignore circles larger than this
+# ── Detection / geometry limits ───────────────────────────────────────────────
+MIN_RADIUS_PX = 4     # At 2 m a tennis ball is roughly 8-10 px radius at 720p.
+MAX_RADIUS_PX = 180   # Ignore circles larger than this.
+MIN_STEREO_RADIUS_RATIO = 0.45
+MAX_TRACK_MISSES = 5
 
 TENNIS_BALL_RADIUS_M = 0.0335   # Physical radius ≈ 33.5 mm (ITF standard)
 
@@ -96,6 +102,13 @@ MAX_EPIPOLAR_Y_DIFF_PX = 4.0
 # ══════════════════════════════════════════════════════════════════════════════
 #  CAMERA LAYER
 # ══════════════════════════════════════════════════════════════════════════════
+
+def fourcc_to_string(value: float) -> str:
+    code = int(value)
+    chars = [chr((code >> 8 * i) & 0xFF) for i in range(4)]
+    text = "".join(chars)
+    return text if text.strip("\x00") else "unknown"
+
 
 class ZEDCamera:
     """
@@ -108,11 +121,21 @@ class ZEDCamera:
         backend = cv2.CAP_DSHOW if sys.platform.startswith("win") else cv2.CAP_V4L2
         self.cap = cv2.VideoCapture(device_id, backend)
 
+        if config.fourcc:
+            fourcc = config.fourcc.upper()
+            if len(fourcc) != 4:
+                raise ValueError("--fourcc must be exactly four characters, such as MJPG")
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  config.frame_width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.frame_height)
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
-        # Disable auto-exposure to keep colour stable
-        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+        self.cap.set(cv2.CAP_PROP_FPS, config.fps)
+        if config.exposure is not None:
+            # V4L2 uses 1.0 for manual mode; DirectShow commonly accepts 0.25.
+            manual_auto_exposure = 0.25 if sys.platform.startswith("win") else 1.0
+            self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, manual_auto_exposure)
+            self.cap.set(cv2.CAP_PROP_EXPOSURE, config.exposure)
+        if config.gain is not None:
+            self.cap.set(cv2.CAP_PROP_GAIN, config.gain)
 
         if not self.cap.isOpened():
             raise RuntimeError(
@@ -122,8 +145,11 @@ class ZEDCamera:
 
         actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        actual_fourcc = fourcc_to_string(self.cap.get(cv2.CAP_PROP_FOURCC))
         print(f"[ZED] Opened at {actual_w}×{actual_h} "
-              f"(eye: {actual_w // 2}×{actual_h})")
+              f"(eye: {actual_w // 2}×{actual_h}) "
+              f"fps={actual_fps:.1f} fourcc={actual_fourcc}")
 
         # Update config to match what the camera actually gave us
         self.cfg.frame_width  = actual_w
@@ -148,61 +174,481 @@ class ZEDCamera:
 #  BALL DETECTOR
 # ══════════════════════════════════════════════════════════════════════════════
 
-Detection = Optional[Tuple[int, int, int]]   # (cx_px, cy_px, radius_px)
+@dataclass
+class BallDetection:
+    """A single image-space ball candidate or tracker prediction."""
+    cx: float
+    cy: float
+    radius: float
+    bbox: Tuple[int, int, int, int]  # x, y, w, h
+    confidence: float
+    source: str
+    score: float = 0.0
+    tracked: bool = False
+    predicted: bool = False
+    mask_area: Optional[float] = None
+
+    @property
+    def center(self) -> Tuple[float, float]:
+        return self.cx, self.cy
+
+    def to_circle(self) -> Tuple[int, int, int]:
+        return int(round(self.cx)), int(round(self.cy)), int(round(self.radius))
+
+    def to_dict(self):
+        x, y, w, h = self.bbox
+        return {
+            "cx": round(self.cx, 2),
+            "cy": round(self.cy, 2),
+            "radius": round(self.radius, 2),
+            "bbox": [x, y, w, h],
+            "confidence": round(self.confidence, 3),
+            "score": round(self.score, 3),
+            "source": self.source,
+            "tracked": self.tracked,
+            "predicted": self.predicted,
+        }
 
 
-class TennisBallDetector:
+Detection = Optional[BallDetection]
+
+
+def clip_bbox(x: float, y: float, w: float, h: float,
+              frame_w: int, frame_h: int) -> Tuple[int, int, int, int]:
+    x1 = max(0, min(frame_w - 1, int(round(x))))
+    y1 = max(0, min(frame_h - 1, int(round(y))))
+    x2 = max(0, min(frame_w, int(round(x + w))))
+    y2 = max(0, min(frame_h, int(round(y + h))))
+    return x1, y1, max(1, x2 - x1), max(1, y2 - y1)
+
+
+def bbox_from_circle(cx: float, cy: float, radius: float,
+                     frame_w: int, frame_h: int) -> Tuple[int, int, int, int]:
+    return clip_bbox(cx - radius, cy - radius, radius * 2, radius * 2, frame_w, frame_h)
+
+
+def bbox_iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ax2, ay2 = ax + aw, ay + ah
+    bx2, by2 = bx + bw, by + bh
+    ix1, iy1 = max(ax, bx), max(ay, by)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    union = aw * ah + bw * bh - inter
+    return float(inter / union) if union > 0 else 0.0
+
+
+def offset_detection(det: BallDetection, dx: int, dy: int,
+                     frame_w: int, frame_h: int) -> BallDetection:
+    x, y, w, h = det.bbox
+    det.cx += dx
+    det.cy += dy
+    det.bbox = clip_bbox(x + dx, y + dy, w, h, frame_w, frame_h)
+    return det
+
+
+def suppress_overlapping(candidates: List[BallDetection],
+                         iou_threshold: float = 0.55) -> List[BallDetection]:
+    ordered = sorted(candidates, key=lambda d: d.score or d.confidence, reverse=True)
+    kept: List[BallDetection] = []
+    for det in ordered:
+        if all(bbox_iou(det.bbox, old.bbox) < iou_threshold for old in kept):
+            kept.append(det)
+    return kept
+
+
+class ColorShapeBallDetector:
     """
-    Detects a single tennis ball in a BGR image using:
-      1. HSV colour masking  →  isolates yellow-green blobs
-      2. Morphological clean-up  →  removes noise
-      3. HoughCircles  →  fits a circle to the blob
-
-    Returns the best (most prominent) circle, or None.
+    OpenCV fallback detector. It is intentionally looser than the original
+    HSV+Hough pass so seams, logos, shadows, and small 2 m balls can still
+    produce candidates for stereo/tracker scoring.
     """
 
     def __init__(self):
-        self._morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        self._open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        self._close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+        self.last_mask: Optional[np.ndarray] = None
 
-    def detect(self, bgr_frame: np.ndarray) -> Detection:
-        hsv  = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, HSV_LOWER, HSV_UPPER)
+    def detect_candidates(self, bgr_frame: np.ndarray) -> List[BallDetection]:
+        h, w = bgr_frame.shape[:2]
+        hsv = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2HSV)
 
-        # Clean up small holes and salt-and-pepper noise
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  self._morph_kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._morph_kernel)
-        mask = cv2.GaussianBlur(mask, (9, 9), 2)
+        # Wider than the old close-range threshold: the real ball has worn felt,
+        # darker print, shadows, and can be motion-blurred at 2 m.
+        lower = np.array([18, 40, 45])
+        upper = np.array([85, 255, 255])
+        mask = cv2.inRange(hsv, lower, upper)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._open_kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._close_kernel)
+        self.last_mask = mask.copy()
 
+        candidates: List[BallDetection] = []
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        min_area = max(10.0, np.pi * MIN_RADIUS_PX * MIN_RADIUS_PX * 0.45)
+
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < min_area:
+                continue
+            perimeter = cv2.arcLength(contour, True)
+            if perimeter <= 0:
+                continue
+            (cx, cy), radius = cv2.minEnclosingCircle(contour)
+            if radius < MIN_RADIUS_PX or radius > MAX_RADIUS_PX:
+                continue
+            circularity = min(1.0, (4.0 * np.pi * area) / (perimeter * perimeter))
+            fill_ratio = min(1.0, area / max(np.pi * radius * radius, 1.0))
+            if circularity < 0.18 or fill_ratio < 0.16:
+                continue
+
+            confidence = min(0.78, 0.22 + 0.30 * circularity + 0.30 * fill_ratio)
+            bbox = bbox_from_circle(cx, cy, radius, w, h)
+            candidates.append(BallDetection(
+                cx=float(cx),
+                cy=float(cy),
+                radius=float(radius),
+                bbox=bbox,
+                confidence=float(confidence),
+                source="opencv",
+                score=float(confidence),
+                mask_area=float(area),
+            ))
+
+        blurred = cv2.GaussianBlur(mask, (7, 7), 1.5)
         circles = cv2.HoughCircles(
-            mask,
+            blurred,
             cv2.HOUGH_GRADIENT,
             dp=1.2,
-            minDist=40,
-            param1=50,
-            param2=18,
+            minDist=24,
+            param1=45,
+            param2=10,
             minRadius=MIN_RADIUS_PX,
             maxRadius=MAX_RADIUS_PX,
         )
+        if circles is not None:
+            for cx, cy, radius in np.round(circles[0]).astype(int):
+                if radius < MIN_RADIUS_PX or radius > MAX_RADIUS_PX:
+                    continue
+                x1, y1, bw, bh = bbox_from_circle(cx, cy, radius, w, h)
+                patch = mask[y1:y1 + bh, x1:x1 + bw]
+                support = float(cv2.countNonZero(patch)) / max(float(bw * bh), 1.0)
+                if support < 0.08:
+                    continue
+                confidence = min(0.70, 0.35 + support)
+                candidates.append(BallDetection(
+                    cx=float(cx),
+                    cy=float(cy),
+                    radius=float(radius),
+                    bbox=(x1, y1, bw, bh),
+                    confidence=float(confidence),
+                    source="opencv-hough",
+                    score=float(confidence),
+                ))
 
-        if circles is None:
+        return suppress_overlapping(candidates)
+
+
+class ONNXBallDetector:
+    """Tiny YOLO-style ONNX detector using OpenCV DNN for Raspberry Pi runtime."""
+
+    def __init__(self, model_path: Optional[str], input_size: int = 320,
+                 conf_threshold: float = 0.35, nms_threshold: float = 0.45):
+        self.model_path = Path(model_path) if model_path else None
+        self.input_size = input_size
+        self.conf_threshold = conf_threshold
+        self.nms_threshold = nms_threshold
+        self.net = None
+
+        if self.model_path and self.model_path.exists():
+            self.net = cv2.dnn.readNetFromONNX(str(self.model_path))
+            self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+            self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+            print(f"[Detector] Loaded ONNX model: {self.model_path}")
+
+    @property
+    def available(self) -> bool:
+        return self.net is not None
+
+    def _letterbox(self, frame: np.ndarray) -> Tuple[np.ndarray, float, int, int]:
+        h, w = frame.shape[:2]
+        scale = min(self.input_size / w, self.input_size / h)
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+        resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        canvas = np.full((self.input_size, self.input_size, 3), 114, dtype=np.uint8)
+        pad_x = (self.input_size - new_w) // 2
+        pad_y = (self.input_size - new_h) // 2
+        canvas[pad_y:pad_y + new_h, pad_x:pad_x + new_w] = resized
+        return canvas, scale, pad_x, pad_y
+
+    @staticmethod
+    def _rows_from_output(output) -> np.ndarray:
+        if isinstance(output, (tuple, list)):
+            output = output[0]
+        rows = np.squeeze(output)
+        if rows.ndim == 1:
+            rows = rows.reshape(1, -1)
+        if rows.ndim == 2 and rows.shape[0] < rows.shape[1] and rows.shape[0] <= 128:
+            rows = rows.T
+        return rows
+
+    @staticmethod
+    def _confidence(row: np.ndarray) -> float:
+        if row.size < 5:
+            return 0.0
+        if row.size == 5:
+            return float(row[4])
+        if row.size == 6:
+            tail = float(row[5])
+            if tail == round(tail):
+                return float(row[4])
+            return float(row[4] * tail) if tail <= 1.0 else float(row[4])
+
+        obj = float(row[4])
+        class_scores = row[5:]
+        best_class = float(np.max(class_scores)) if class_scores.size else 1.0
+        yolo_v5_conf = obj * best_class
+        yolo_v8_conf = float(np.max(row[4:]))
+        return yolo_v8_conf if yolo_v8_conf > 0.80 and yolo_v5_conf < 0.20 else yolo_v5_conf
+
+    def detect_candidates(self, bgr_frame: np.ndarray) -> List[BallDetection]:
+        if not self.available:
+            return []
+
+        h, w = bgr_frame.shape[:2]
+        canvas, scale, pad_x, pad_y = self._letterbox(bgr_frame)
+        blob = cv2.dnn.blobFromImage(
+            canvas,
+            scalefactor=1.0 / 255.0,
+            size=(self.input_size, self.input_size),
+            mean=(0, 0, 0),
+            swapRB=True,
+            crop=False,
+        )
+        self.net.setInput(blob)
+        rows = self._rows_from_output(self.net.forward())
+
+        boxes: List[Tuple[int, int, int, int]] = []
+        confidences: List[float] = []
+        for row in rows:
+            conf = self._confidence(row)
+            if conf < self.conf_threshold:
+                continue
+            cx, cy, bw, bh = [float(v) for v in row[:4]]
+            if max(abs(cx), abs(cy), abs(bw), abs(bh)) <= 2.0:
+                cx *= self.input_size
+                cy *= self.input_size
+                bw *= self.input_size
+                bh *= self.input_size
+            x = (cx - bw / 2.0 - pad_x) / scale
+            y = (cy - bh / 2.0 - pad_y) / scale
+            bw /= scale
+            bh /= scale
+            box = clip_bbox(x, y, bw, bh, w, h)
+            if box[2] < MIN_RADIUS_PX * 2 or box[3] < MIN_RADIUS_PX * 2:
+                continue
+            boxes.append(box)
+            confidences.append(float(conf))
+
+        if not boxes:
+            return []
+
+        indices = cv2.dnn.NMSBoxes(boxes, confidences, self.conf_threshold, self.nms_threshold)
+        if len(indices) == 0:
+            return []
+
+        candidates: List[BallDetection] = []
+        for idx in np.array(indices).flatten():
+            x, y, bw, bh = boxes[int(idx)]
+            radius = max(1.0, (bw + bh) / 4.0)
+            candidates.append(BallDetection(
+                cx=float(x + bw / 2.0),
+                cy=float(y + bh / 2.0),
+                radius=float(radius),
+                bbox=(x, y, bw, bh),
+                confidence=float(confidences[int(idx)]),
+                source="model",
+                score=float(confidences[int(idx)] + 0.20),
+            ))
+        return candidates
+
+
+class ImageBallTracker:
+    """Constant-velocity Kalman tracker for one eye: x, y, radius."""
+
+    def __init__(self, max_missed: int = MAX_TRACK_MISSES):
+        self.max_missed = max_missed
+        self.kalman = cv2.KalmanFilter(6, 3)
+        self.kalman.transitionMatrix = np.eye(6, dtype=np.float32)
+        self.kalman.measurementMatrix = np.zeros((3, 6), dtype=np.float32)
+        self.kalman.measurementMatrix[0, 0] = 1.0
+        self.kalman.measurementMatrix[1, 1] = 1.0
+        self.kalman.measurementMatrix[2, 2] = 1.0
+        self.kalman.processNoiseCov = np.diag([4, 4, 2, 25, 25, 8]).astype(np.float32)
+        self.kalman.measurementNoiseCov = np.diag([12, 12, 6]).astype(np.float32)
+        self.kalman.errorCovPost = np.eye(6, dtype=np.float32) * 10.0
+        self.initialized = False
+        self.missed = 0
+        self.last_prediction: Detection = None
+        self._last_t: Optional[float] = None
+
+    def _set_dt(self, now: float):
+        if self._last_t is None:
+            dt = 1.0 / 30.0
+        else:
+            dt = max(1.0 / 120.0, min(0.20, now - self._last_t))
+        self._last_t = now
+        self.kalman.transitionMatrix[:] = np.array([
+            [1, 0, 0, dt, 0,  0],
+            [0, 1, 0, 0,  dt, 0],
+            [0, 0, 1, 0,  0,  dt],
+            [0, 0, 0, 1,  0,  0],
+            [0, 0, 0, 0,  1,  0],
+            [0, 0, 0, 0,  0,  1],
+        ], dtype=np.float32)
+
+    def predict(self, frame_shape: Tuple[int, int, int]) -> Detection:
+        if not self.initialized:
+            self.last_prediction = None
             return None
+        self._set_dt(time.time())
+        pred = self.kalman.predict()
+        h, w = frame_shape[:2]
+        cx = float(pred[0, 0])
+        cy = float(pred[1, 0])
+        radius = float(max(MIN_RADIUS_PX, pred[2, 0]))
+        if cx < -radius or cy < -radius or cx > w + radius or cy > h + radius:
+            self.missed += 1
+            self.last_prediction = None
+            return None
+        confidence = max(0.10, 0.55 * (1.0 - self.missed / max(self.max_missed + 1, 1)))
+        self.last_prediction = BallDetection(
+            cx=cx,
+            cy=cy,
+            radius=radius,
+            bbox=bbox_from_circle(cx, cy, radius, w, h),
+            confidence=float(confidence),
+            source="tracker",
+            score=float(confidence * 0.75),
+            tracked=True,
+            predicted=True,
+        )
+        self.missed += 1
+        return self.last_prediction if self.missed <= self.max_missed else None
 
-        # Pick the largest circle (most likely the real ball, not glare)
-        circles = np.round(circles[0]).astype(int)
-        cx, cy, r = max(circles, key=lambda c: c[2])
-        return int(cx), int(cy), int(r)
+    def correct(self, det: BallDetection, frame_shape: Tuple[int, int, int]) -> BallDetection:
+        h, w = frame_shape[:2]
+        measurement = np.array([[det.cx], [det.cy], [det.radius]], dtype=np.float32)
+        if not self.initialized:
+            self.kalman.statePost = np.array(
+                [[det.cx], [det.cy], [det.radius], [0], [0], [0]], dtype=np.float32
+            )
+            self.initialized = True
+        else:
+            corrected = self.kalman.correct(measurement)
+            det.cx = float(corrected[0, 0])
+            det.cy = float(corrected[1, 0])
+            det.radius = float(max(MIN_RADIUS_PX, corrected[2, 0]))
+            det.bbox = bbox_from_circle(det.cx, det.cy, det.radius, w, h)
+        det.tracked = True
+        det.predicted = False
+        self.missed = 0
+        self.last_prediction = det
+        return det
+
+    def search_roi(self, frame_shape: Tuple[int, int, int],
+                   padding_scale: float = 3.0) -> Optional[Tuple[int, int, int, int]]:
+        pred = self.last_prediction
+        if pred is None or self.missed > self.max_missed:
+            return None
+        h, w = frame_shape[:2]
+        pad = max(56.0, pred.radius * padding_scale + self.missed * 18.0)
+        return clip_bbox(pred.cx - pad, pred.cy - pad, pad * 2, pad * 2, w, h)
+
+
+class TennisBallDetector:
+    """Hybrid model-first detector with OpenCV fallback and tracker-aware scoring."""
+
+    def __init__(self, mode: str = "hybrid", model_path: Optional[str] = None,
+                 conf_threshold: float = 0.35, nms_threshold: float = 0.45,
+                 model_input_size: int = 320):
+        self.mode = mode
+        self.model = ONNXBallDetector(model_path, model_input_size, conf_threshold, nms_threshold)
+        self.fallback = ColorShapeBallDetector()
+        self.last_debug_mask: Optional[np.ndarray] = None
+
+        if mode in ("hybrid", "model") and not self.model.available:
+            message = f"[Detector] ONNX model not found or unavailable: {model_path}"
+            if mode == "model":
+                raise FileNotFoundError(message)
+            print(message + " — using OpenCV fallback until a model is added.")
+
+    def _score(self, det: BallDetection, prediction: Detection = None) -> BallDetection:
+        source_bonus = {
+            "model": 0.28,
+            "opencv": 0.05,
+            "opencv-hough": 0.03,
+            "tracker": -0.10,
+        }.get(det.source, 0.0)
+        score = det.confidence + source_bonus
+        if prediction is not None:
+            dist = np.hypot(det.cx - prediction.cx, det.cy - prediction.cy)
+            gate = max(24.0, prediction.radius * 4.0)
+            score += 0.30 * max(0.0, 1.0 - dist / gate)
+        det.score = float(score)
+        return det
+
+    def detect_candidates(self, bgr_frame: np.ndarray,
+                          prediction: Detection = None,
+                          roi: Optional[Tuple[int, int, int, int]] = None
+                          ) -> Tuple[List[BallDetection], Optional[np.ndarray]]:
+        h, w = bgr_frame.shape[:2]
+        search_frame = bgr_frame
+        offset_x = 0
+        offset_y = 0
+        if roi is not None:
+            offset_x, offset_y, roi_w, roi_h = roi
+            search_frame = bgr_frame[offset_y:offset_y + roi_h, offset_x:offset_x + roi_w]
+
+        candidates: List[BallDetection] = []
+        if self.mode in ("hybrid", "model") and self.model.available:
+            candidates.extend(self.model.detect_candidates(search_frame))
+        if self.mode in ("hybrid", "opencv"):
+            candidates.extend(self.fallback.detect_candidates(search_frame))
+
+        debug_mask = self.fallback.last_mask
+        if roi is not None:
+            candidates = [offset_detection(det, offset_x, offset_y, w, h) for det in candidates]
+            if not candidates:
+                # Fall back to a full-frame scan if the tracker ROI lost the ball.
+                candidates, debug_mask = self.detect_candidates(bgr_frame, prediction, roi=None)
+                return candidates, debug_mask
+
+        scored = [self._score(det, prediction) for det in candidates]
+        return suppress_overlapping(scored), debug_mask
 
     @staticmethod
     def annotate(frame: np.ndarray, det: Detection,
                  circle_color=(0, 255, 0), text: str = "") -> np.ndarray:
         if det is None:
             return frame
-        cx, cy, r = det
+        cx, cy, r = det.to_circle()
+        x, y, w, h = det.bbox
+        if det.predicted:
+            circle_color = (0, 180, 255)
+        cv2.rectangle(frame, (x, y), (x + w, y + h), circle_color, 1)
         cv2.circle(frame, (cx, cy), r, circle_color, 2)
         cv2.circle(frame, (cx, cy), 4, (0, 0, 255), -1)
-        if text:
-            cv2.putText(frame, text, (cx + r + 5, cy),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, circle_color, 2)
+        label = text
+        if det.source:
+            label = f"{label} {det.source}:{det.confidence:.2f}".strip()
+        if det.predicted:
+            label += " pred"
+        if label:
+            cv2.putText(frame, label, (min(cx + r + 5, frame.shape[1] - 180), max(18, cy)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, circle_color, 1)
         return frame
 
 
@@ -305,8 +751,8 @@ def validate_stereo_pair(left: Detection, right: Detection,
             missing.append("RIGHT")
         return False, "Ball not detected in " + " ".join(missing)
 
-    xl, yl, rl = left
-    xr, yr, rr = right
+    xl, yl, rl = left.cx, left.cy, left.radius
+    xr, yr, rr = right.cx, right.cy, right.radius
     y_diff = abs(float(yl - yr))
     if y_diff > max_y_diff:
         return False, f"Rejected pair: epipolar y-diff {y_diff:.1f}px > {max_y_diff:.1f}px"
@@ -316,10 +762,82 @@ def validate_stereo_pair(left: Detection, right: Detection,
         return False, f"Rejected pair: invalid disparity {disparity:.1f}px"
 
     radius_ratio = min(rl, rr) / max(rl, rr)
-    if radius_ratio < 0.65:
-        return False, f"Rejected pair: radius mismatch L={rl}px R={rr}px"
+    if radius_ratio < MIN_STEREO_RADIUS_RATIO:
+        return False, f"Rejected pair: radius mismatch L={rl:.1f}px R={rr:.1f}px"
 
     return True, "OK"
+
+
+def choose_stereo_pair(left_candidates: Sequence[BallDetection],
+                       right_candidates: Sequence[BallDetection],
+                       config: CameraConfig,
+                       max_y_diff: float = MAX_EPIPOLAR_Y_DIFF_PX
+                       ) -> Tuple[Detection, Detection, bool, str]:
+    best_pair: Tuple[Detection, Detection] = (None, None)
+    best_score = -1e9
+    best_rejection = "Ball not detected"
+
+    if not left_candidates or not right_candidates:
+        missing = []
+        if not left_candidates:
+            missing.append("LEFT")
+        if not right_candidates:
+            missing.append("RIGHT")
+        return None, None, False, "Ball not detected in " + " ".join(missing)
+
+    for left in left_candidates:
+        for right in right_candidates:
+            y_diff = abs(float(left.cy - right.cy))
+            disparity = float(left.cx - right.cx)
+            if disparity <= 1.0:
+                best_rejection = f"Rejected pair: invalid disparity {disparity:.1f}px"
+                continue
+            if y_diff > max_y_diff:
+                best_rejection = f"Rejected pair: epipolar y-diff {y_diff:.1f}px > {max_y_diff:.1f}px"
+                continue
+            radius_ratio = min(left.radius, right.radius) / max(left.radius, right.radius)
+            if radius_ratio < MIN_STEREO_RADIUS_RATIO:
+                best_rejection = (
+                    f"Rejected pair: radius mismatch L={left.radius:.1f}px "
+                    f"R={right.radius:.1f}px"
+                )
+                continue
+
+            stereo_z = (config.fx * config.baseline) / disparity
+            avg_radius_px = max((left.radius + right.radius) / 2.0, 1.0)
+            size_z = (config.fx * TENNIS_BALL_RADIUS_M) / avg_radius_px
+            size_ratio = min(stereo_z, size_z) / max(stereo_z, size_z)
+            if size_ratio < 0.22:
+                best_rejection = (
+                    f"Rejected pair: depth/size disagreement Z={stereo_z:.2f}m "
+                    f"size_Z={size_z:.2f}m"
+                )
+                continue
+
+            epipolar_score = max(0.0, 1.0 - y_diff / max(max_y_diff, 1.0))
+            score = (
+                left.score + right.score
+                + 0.35 * epipolar_score
+                + 0.25 * radius_ratio
+                + 0.20 * size_ratio
+            )
+            if left.predicted or right.predicted:
+                score -= 0.30
+            if score > best_score:
+                best_score = score
+                best_pair = (left, right)
+
+    if best_pair[0] is None or best_pair[1] is None:
+        return None, None, False, best_rejection
+
+    left, right = best_pair
+    sources = f"{left.source}+{right.source}"
+    status = (
+        f"OK {sources} conf={min(left.confidence, right.confidence):.2f}"
+        if not (left.predicted or right.predicted)
+        else f"TRACKED {sources} conf={min(left.confidence, right.confidence):.2f}"
+    )
+    return left, right, True, status
 
 @dataclass
 class BallPosition:
@@ -332,11 +850,17 @@ class BallPosition:
     known_Z: Optional[float] = None
     depth_error: Optional[float] = None
     depth_error_pct: Optional[float] = None
+    confidence: float = 0.0
+    source: str = ""
+    tracked: bool = False
+    predicted: bool = False
 
     def __str__(self):
+        mode = "pred" if self.predicted else "meas"
         msg = (f"X={self.X:+.3f} m  Y={self.Y:+.3f} m  Z={self.Z:.3f} m  "
                f"(disp={self.disparity:.1f} px | ydiff={self.epipolar_y_diff:.1f} px "
-               f"| size_Z={self.size_Z:.3f} m)")
+               f"| size_Z={self.size_Z:.3f} m | {mode} {self.source} "
+               f"conf={self.confidence:.2f})")
         if self.depth_error is not None and self.depth_error_pct is not None:
             msg += (f" | known_Z={self.known_Z:.3f} m "
                     f"err={self.depth_error:+.3f} m ({self.depth_error_pct:+.1f}%)")
@@ -350,6 +874,10 @@ class BallPosition:
             "disparity": round(self.disparity, 2),
             "size_Z": round(self.size_Z, 4),
             "epipolar_y_diff": round(self.epipolar_y_diff, 2),
+            "confidence": round(self.confidence, 3),
+            "source": self.source,
+            "tracked": self.tracked,
+            "predicted": self.predicted,
         }
         if self.known_Z is not None:
             record["known_Z"] = round(self.known_Z, 4)
@@ -382,8 +910,8 @@ class StereoTriangulator:
         if left is None or right is None:
             return None
 
-        xl, yl, rl = left
-        xr, yr, rr = right
+        xl, yl, rl = left.cx, left.cy, left.radius
+        xr, yr, rr = right.cx, right.cy, right.radius
 
         disparity = float(xl - xr)
         if disparity <= 1.0:
@@ -416,6 +944,91 @@ class StereoTriangulator:
             known_Z=known_Z,
             depth_error=depth_error,
             depth_error_pct=depth_error_pct,
+            confidence=min(left.confidence, right.confidence),
+            source=f"{left.source}+{right.source}",
+            tracked=left.tracked or right.tracked,
+            predicted=left.predicted or right.predicted,
+        )
+
+
+class PositionTracker3D:
+    """Constant-velocity tracker for X, Y, Z position smoothing and short gaps."""
+
+    def __init__(self, max_missed: int = MAX_TRACK_MISSES):
+        self.max_missed = max_missed
+        self.kalman = cv2.KalmanFilter(6, 3)
+        self.kalman.transitionMatrix = np.eye(6, dtype=np.float32)
+        self.kalman.measurementMatrix = np.zeros((3, 6), dtype=np.float32)
+        self.kalman.measurementMatrix[0, 0] = 1.0
+        self.kalman.measurementMatrix[1, 1] = 1.0
+        self.kalman.measurementMatrix[2, 2] = 1.0
+        self.kalman.processNoiseCov = np.diag([0.01, 0.01, 0.02, 1.0, 1.0, 1.2]).astype(np.float32)
+        self.kalman.measurementNoiseCov = np.diag([0.03, 0.03, 0.06]).astype(np.float32)
+        self.kalman.errorCovPost = np.eye(6, dtype=np.float32)
+        self.initialized = False
+        self.missed = 0
+        self._last_t: Optional[float] = None
+        self._last_template: Optional[BallPosition] = None
+
+    def _set_dt(self, now: float):
+        if self._last_t is None:
+            dt = 1.0 / 30.0
+        else:
+            dt = max(1.0 / 120.0, min(0.25, now - self._last_t))
+        self._last_t = now
+        self.kalman.transitionMatrix[:] = np.array([
+            [1, 0, 0, dt, 0,  0],
+            [0, 1, 0, 0,  dt, 0],
+            [0, 0, 1, 0,  0,  dt],
+            [0, 0, 0, 1,  0,  0],
+            [0, 0, 0, 0,  1,  0],
+            [0, 0, 0, 0,  0,  1],
+        ], dtype=np.float32)
+
+    def correct(self, pos: BallPosition) -> BallPosition:
+        self._set_dt(time.time())
+        measurement = np.array([[pos.X], [pos.Y], [pos.Z]], dtype=np.float32)
+        if not self.initialized:
+            self.kalman.statePost = np.array(
+                [[pos.X], [pos.Y], [pos.Z], [0], [0], [0]], dtype=np.float32
+            )
+            self.initialized = True
+            smoothed = self.kalman.statePost
+        else:
+            smoothed = self.kalman.correct(measurement)
+
+        pos.X = float(smoothed[0, 0])
+        pos.Y = float(smoothed[1, 0])
+        pos.Z = float(max(0.0, smoothed[2, 0]))
+        pos.tracked = True
+        pos.predicted = False
+        self.missed = 0
+        self._last_template = pos
+        return pos
+
+    def predict(self) -> Optional[BallPosition]:
+        if not self.initialized or self.missed >= self.max_missed:
+            return None
+        self._set_dt(time.time())
+        pred = self.kalman.predict()
+        self.missed += 1
+        template = self._last_template
+        if template is None:
+            return None
+        return BallPosition(
+            X=float(pred[0, 0]),
+            Y=float(pred[1, 0]),
+            Z=float(max(0.0, pred[2, 0])),
+            disparity=template.disparity,
+            size_Z=template.size_Z,
+            epipolar_y_diff=template.epipolar_y_diff,
+            known_Z=template.known_Z,
+            depth_error=template.depth_error,
+            depth_error_pct=template.depth_error_pct,
+            confidence=max(0.10, template.confidence * (1.0 - self.missed / (self.max_missed + 1))),
+            source="3d-tracker",
+            tracked=True,
+            predicted=True,
         )
 
 
@@ -579,7 +1192,11 @@ def overlay_info(frame: np.ndarray, pos: Optional[BallPosition],
     cv2.rectangle(frame, (0, 0), (w, 60), (30, 30, 30), -1)
 
     if pos:
-        txt = f"X:{pos.X:+.3f}m  Y:{pos.Y:+.3f}m  Z:{pos.Z:.3f}m  disp:{pos.disparity:.1f}px"
+        state = "PRED" if pos.predicted else "MEAS"
+        txt = (
+            f"{state} X:{pos.X:+.3f}m  Y:{pos.Y:+.3f}m  Z:{pos.Z:.3f}m  "
+            f"disp:{pos.disparity:.1f}px {pos.source} c:{pos.confidence:.2f}"
+        )
         if pos.depth_error is not None:
             txt += f"  err:{pos.depth_error:+.3f}m"
         cv2.putText(frame, txt, (10, 22),
@@ -615,6 +1232,24 @@ def parse_args():
                    help="Requested camera frame rate (default 30)")
     p.add_argument("--fourcc",      type=str,   default="MJPG",
                    help="Pixel format (default MJPG — avoids green-screen on ZED)")
+    p.add_argument("--exposure", type=float, default=None,
+                   help="Optional manual camera exposure value. Lower values reduce motion blur.")
+    p.add_argument("--gain", type=float, default=None,
+                   help="Optional manual camera gain value.")
+    p.add_argument("--detector", choices=["hybrid", "model", "opencv"], default="hybrid",
+                   help="Detection mode: model-first hybrid, model only, or OpenCV fallback only")
+    p.add_argument("--model", type=str, default="models/tennis_ball.onnx",
+                   help="Path to YOLO-style ONNX ball detector for hybrid/model mode")
+    p.add_argument("--conf-threshold", type=float, default=0.35,
+                   help="Minimum ONNX detector confidence")
+    p.add_argument("--nms-threshold", type=float, default=0.45,
+                   help="ONNX detector non-maximum suppression IoU threshold")
+    p.add_argument("--model-input-size", type=int, default=320,
+                   help="Square ONNX detector input size, e.g. 320 or 416")
+    p.add_argument("--debug-mask", action="store_true",
+                   help="Show the OpenCV fallback mask for debugging")
+    p.add_argument("--max-track-misses", type=int, default=MAX_TRACK_MISSES,
+                   help="Frames to keep predicting through short detector misses")
     p.add_argument("--zed-calibration", type=str, default=None,
                    help="Path to Stereolabs factory .conf file (e.g. SN28837104.conf). "
                         "Enables full rectification without a checkerboard.")
@@ -639,6 +1274,14 @@ def main():
     args = parse_args()
     if args.known_distance is not None and args.known_distance <= 0:
         raise ValueError("--known-distance must be a positive distance in metres")
+    if not 0.0 < args.conf_threshold <= 1.0:
+        raise ValueError("--conf-threshold must be in the range (0, 1]")
+    if not 0.0 < args.nms_threshold <= 1.0:
+        raise ValueError("--nms-threshold must be in the range (0, 1]")
+    if args.model_input_size <= 0:
+        raise ValueError("--model-input-size must be positive")
+    if args.max_track_misses < 0:
+        raise ValueError("--max-track-misses must be non-negative")
 
     # ── Setup ──────────────────────────────────────────────────────────────
     # Priority: factory .conf  ->  checkerboard .npz  ->  hardcoded defaults
@@ -648,6 +1291,8 @@ def main():
         frame_height=args.height,
         fps=args.fps,
         fourcc=args.fourcc,
+        exposure=args.exposure,
+        gain=args.gain,
     )
     if args.zed_calibration:
         config = load_zed_factory_calibration(
@@ -658,7 +1303,16 @@ def main():
 
     camera       = ZEDCamera(device_id=args.device, config=config)
     rectifier    = StereoRectifier(camera.cfg)
-    detector     = TennisBallDetector()
+    detector     = TennisBallDetector(
+        mode=args.detector,
+        model_path=args.model,
+        conf_threshold=args.conf_threshold,
+        nms_threshold=args.nms_threshold,
+        model_input_size=args.model_input_size,
+    )
+    left_tracker = ImageBallTracker(max_missed=args.max_track_misses)
+    right_tracker = ImageBallTracker(max_missed=args.max_track_misses)
+    position_tracker = PositionTracker3D(max_missed=args.max_track_misses)
     triangulator = StereoTriangulator(config=camera.cfg)  # use updated config
 
     log_file = open(args.log, "a") if args.log else None
@@ -682,25 +1336,52 @@ def main():
 
         left, right = rectifier.rectify(left, right)
 
-        # ── Detect ──────────────────────────────────────────────────────
-        left_det  = detector.detect(left)
-        right_det = detector.detect(right)
+        # ── Detect + track ─────────────────────────────────────────────
+        left_pred = left_tracker.predict(left.shape)
+        right_pred = right_tracker.predict(right.shape)
+        left_roi = left_tracker.search_roi(left.shape)
+        right_roi = right_tracker.search_roi(right.shape)
 
-        pair_ok, status_message = validate_stereo_pair(
-            left_det,
-            right_det,
+        left_candidates, left_mask = detector.detect_candidates(left, left_pred, left_roi)
+        right_candidates, right_mask = detector.detect_candidates(right, right_pred, right_roi)
+        if left_pred is not None:
+            left_candidates.append(left_pred)
+        if right_pred is not None:
+            right_candidates.append(right_pred)
+
+        left_det, right_det, pair_ok, status_message = choose_stereo_pair(
+            left_candidates,
+            right_candidates,
+            config=camera.cfg,
             max_y_diff=args.max_epipolar_y_diff,
         )
 
-        # ── Triangulate ─────────────────────────────────────────────────
-        position = (
-            triangulator.triangulate(
+        # ── Triangulate + smooth ────────────────────────────────────────
+        position = None
+        if pair_ok and left_det is not None and right_det is not None:
+            if not left_det.predicted:
+                left_det = left_tracker.correct(left_det, left.shape)
+            if not right_det.predicted:
+                right_det = right_tracker.correct(right_det, right.shape)
+
+            position = triangulator.triangulate(
                 left_det,
                 right_det,
                 known_depth_m=args.known_distance,
             )
-            if pair_ok else None
-        )
+            if position is not None and not position.predicted:
+                position = position_tracker.correct(position)
+            elif position is not None:
+                tracked_position = position_tracker.predict()
+                if tracked_position is not None:
+                    tracked_position.disparity = position.disparity
+                    tracked_position.size_Z = position.size_Z
+                    tracked_position.epipolar_y_diff = position.epipolar_y_diff
+                    position = tracked_position
+        else:
+            position = position_tracker.predict()
+            if position is not None:
+                status_message = "TRACKED 3d-tracker prediction through detector miss"
 
         # ── Log / print ─────────────────────────────────────────────────
         if position:
@@ -711,6 +1392,8 @@ def main():
                     "t": time.time(),
                     "rectified": rectifier.enabled,
                     "status": status_message,
+                    "left_detection": left_det.to_dict() if left_det else None,
+                    "right_detection": right_det.to_dict() if right_det else None,
                     **position.to_dict(),
                 }
                 log_file.write(json.dumps(record) + "\n")
@@ -729,6 +1412,10 @@ def main():
             # Annotate each eye
             detector.annotate(left,  left_det,  circle_color=(0, 255, 0),   text="L")
             detector.annotate(right, right_det, circle_color=(0, 200, 255), text="R")
+            if left_pred is not None and left_det is not left_pred:
+                detector.annotate(left, left_pred, circle_color=(0, 160, 255), text="L")
+            if right_pred is not None and right_det is not right_pred:
+                detector.annotate(right, right_pred, circle_color=(0, 160, 255), text="R")
 
             # Combine side by side and downscale for Pi's display
             combined = np.hstack([left, right])
@@ -736,6 +1423,16 @@ def main():
             overlay_info(combined, position, fps, status_message)
 
             cv2.imshow("ZED Ball Detection", combined)
+            if args.debug_mask and left_mask is not None and right_mask is not None:
+                mask_h = min(left_mask.shape[0], right_mask.shape[0])
+                mask_l = left_mask[:mask_h]
+                mask_r = right_mask[:mask_h]
+                mask_combined = np.hstack([
+                    cv2.cvtColor(mask_l, cv2.COLOR_GRAY2BGR),
+                    cv2.cvtColor(mask_r, cv2.COLOR_GRAY2BGR),
+                ])
+                mask_combined = cv2.resize(mask_combined, (1280, 360))
+                cv2.imshow("OpenCV Fallback Mask", mask_combined)
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
