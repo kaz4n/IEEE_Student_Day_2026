@@ -11,18 +11,19 @@ Coordinate frame (camera-centered):
   +Z → forward (away from camera)
 
 Requirements:
-  sudo apt install python3-opencv python3-numpy v4l-utils
+  pip install opencv-python numpy
 
 Usage:
   python3 ball_detection.py
-  python3 ball_detection.py --calibration my_calibration.npz
+  python3 ball_detection.py --zed-calibration SN28837104.conf
+  python3 ball_detection.py --zed-calibration SN28837104.conf --calibration calibration.npz
   python3 ball_detection.py --no-display      (headless / SSH mode)
-  python3 ball_detection.py --width 1280 --height 360 --fps 15
 """
 
 import cv2
 import numpy as np
 import argparse
+import configparser
 import time
 import json
 import sys
@@ -43,20 +44,18 @@ class CameraConfig:
     Default values are for ZED (not ZED Mini) at 720p (1280×720 per eye).
     Run calibrate_stereo.py with a checkerboard to get accurate values.
     """
-    # ── Intrinsics (shared approximation for both eyes at 720p) ──────────────
-    fx: float = 700.0       # Focal length in pixels (x)
-    fy: float = 700.0       # Focal length in pixels (y)
-    cx: float = 640.0       # Principal point x  (≈ width/2)
-    cy: float = 360.0       # Principal point y  (≈ height/2)
+    # ── Intrinsics — left eye, HD 1280×720 (from SN28837104 factory cal) ───────
+    fx: float = 532.935     # Focal length x
+    fy: float = 532.470     # Focal length y
+    cx: float = 642.825     # Principal point x
+    cy: float = 368.369     # Principal point y
 
     # ── Extrinsics ────────────────────────────────────────────────────────────
-    baseline: float = 0.12  # Stereo baseline in metres (ZED = 120 mm)
+    baseline: float = 0.120144  # Stereo baseline in metres (ZED 2 SN28837104)
 
     # ── Frame geometry ────────────────────────────────────────────────────────
     frame_width:  int = 2560  # Full side-by-side width from USB capture
     frame_height: int = 720   # Full frame height
-    fps: float = 30.0
-    fourcc: Optional[str] = None
 
     # Full stereo calibration. These are required for rectification.
     calibration_image_size: Optional[Tuple[int, int]] = None  # (eye_width, height)
@@ -91,37 +90,12 @@ MAX_RADIUS_PX = 150  # Ignore circles larger than this
 TENNIS_BALL_RADIUS_M = 0.0335   # Physical radius ≈ 33.5 mm (ITF standard)
 
 # Rectified stereo pairs should have almost the same y coordinate.
-MAX_EPIPOLAR_Y_DIFF_PX = 10.0
+MAX_EPIPOLAR_Y_DIFF_PX = 4.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CAMERA LAYER
 # ══════════════════════════════════════════════════════════════════════════════
-
-def fourcc_to_string(value: float) -> str:
-    code = int(value)
-    chars = [chr((code >> 8 * i) & 0xFF) for i in range(4)]
-    text = "".join(chars)
-    return text if text.strip("\x00") else "unknown"
-
-
-def camera_open_error(device_id: int) -> str:
-    if sys.platform.startswith("win"):
-        return (
-            f"Cannot open camera at device {device_id}. "
-            "Check the USB connection and camera permissions."
-        )
-
-    device_path = f"/dev/video{device_id}"
-    return (
-        f"Cannot open camera at device {device_id} ({device_path}). "
-        "Check the USB connection, verify the correct node with "
-        "`v4l2-ctl --list-devices`, inspect formats with "
-        f"`v4l2-ctl -d {device_path} --list-formats-ext`, and make sure your "
-        "user is in the video group with `sudo usermod -aG video \"$USER\"` "
-        "then log out and back in."
-    )
-
 
 class ZEDCamera:
     """
@@ -134,29 +108,22 @@ class ZEDCamera:
         backend = cv2.CAP_DSHOW if sys.platform.startswith("win") else cv2.CAP_V4L2
         self.cap = cv2.VideoCapture(device_id, backend)
 
-        if config.fourcc:
-            fourcc = config.fourcc.upper()
-            if len(fourcc) != 4:
-                raise ValueError("--fourcc must be exactly four characters, such as MJPG")
-            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  config.frame_width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.frame_height)
-        self.cap.set(cv2.CAP_PROP_FPS, config.fps)
+        self.cap.set(cv2.CAP_PROP_FPS, 30)
         # Disable auto-exposure to keep colour stable
         self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
 
         if not self.cap.isOpened():
-            raise RuntimeError(camera_open_error(device_id))
+            raise RuntimeError(
+                f"Cannot open camera at device {device_id}. "
+                "Check USB connection and camera permissions."
+            )
 
         actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
-        actual_fourcc = fourcc_to_string(self.cap.get(cv2.CAP_PROP_FOURCC))
-        print(
-            f"[ZED] Opened at {actual_w}×{actual_h} "
-            f"(eye: {actual_w // 2}×{actual_h}) "
-            f"fps={actual_fps:.1f} fourcc={actual_fourcc}"
-        )
+        print(f"[ZED] Opened at {actual_w}×{actual_h} "
+              f"(eye: {actual_w // 2}×{actual_h})")
 
         # Update config to match what the camera actually gave us
         self.cfg.frame_width  = actual_w
@@ -462,17 +429,6 @@ def load_calibration(path: str, config: CameraConfig) -> CameraConfig:
     File format: NumPy .npz with keys  fx, fy, cx, cy, baseline,
     K_l, D_l, K_r, D_r, R, T, and optional image_width/image_height.
     """
-    calibration_path = Path(path)
-    if not calibration_path.exists():
-        raise FileNotFoundError(
-            f"Calibration file not found: {calibration_path}\n"
-            "Create it first with:\n"
-            "  python3 calibrate_stereo.py --device 0\n"
-            "Then run detection with:\n"
-            "  python3 ball_detection.py --device 0 --calibration calibration.npz\n"
-            "For an uncalibrated quick camera test, omit the --calibration option."
-        )
-
     data = np.load(path)
     config.fx       = float(data["fx"])
     config.fy       = float(data["fy"])
@@ -493,6 +449,8 @@ def load_calibration(path: str, config: CameraConfig) -> CameraConfig:
                 int(data["image_width"]),
                 int(data["image_height"]),
             )
+        # Use only the horizontal component — T[0] is the true stereo baseline.
+        # norm(T) would include tiny vertical/depth offsets and slightly overestimate.
         config.baseline = abs(float(config.T[0]))
     else:
         missing = ", ".join(k for k in required if k not in data)
@@ -503,6 +461,111 @@ def load_calibration(path: str, config: CameraConfig) -> CameraConfig:
           f"cx={config.cx:.1f}  cy={config.cy:.1f}  B={config.baseline*1000:.1f} mm")
     return config
 
+
+def load_zed_factory_calibration(conf_path: str, config: CameraConfig,
+                                  resolution: str = "HD") -> CameraConfig:
+    """
+    Parse a Stereolabs factory .conf file (e.g. SN28837104.conf) and populate
+    the full set of intrinsics, distortion, and stereo extrinsics in OpenCV format.
+
+    resolution choices: '2K'  (2208x1242)
+                        'FHD' (1920x1080)
+                        'HD'  (1280x720)   <- default, matches our capture size
+                        'VGA' (672x376)
+
+    After loading this file, full stereo rectification is enabled without
+    needing to run calibrate_stereo.py first.
+    """
+    conf_file = Path(conf_path)
+    if not conf_file.exists():
+        raise FileNotFoundError(
+            f"ZED factory calibration file not found: {conf_path}\n"
+            "Download it from https://calib.stereolabs.com/?SN=<your_serial_number>"
+        )
+
+    parser = configparser.ConfigParser()
+    parser.read(conf_path)
+
+    left_key  = f"LEFT_CAM_{resolution}"
+    right_key = f"RIGHT_CAM_{resolution}"
+
+    available = parser.sections()
+    if left_key not in available or right_key not in available:
+        raise ValueError(
+            f"Resolution '{resolution}' not found in {conf_path}.\n"
+            f"Available sections: {available}\n"
+            f"Choose from: 2K, FHD, HD, VGA"
+        )
+
+    def get(section, key):
+        return float(parser[section][key])
+
+    # -- Intrinsics -----------------------------------------------------------
+    fx_l = get(left_key,  "fx");  fy_l = get(left_key,  "fy")
+    cx_l = get(left_key,  "cx");  cy_l = get(left_key,  "cy")
+    fx_r = get(right_key, "fx");  fy_r = get(right_key, "fy")
+    cx_r = get(right_key, "cx");  cy_r = get(right_key, "cy")
+
+    config.fx = fx_l
+    config.fy = fy_l
+    config.cx = cx_l
+    config.cy = cy_l
+
+    # -- Distortion (standard 5-parameter OpenCV model: k1,k2,p1,p2,k3) ------
+    def distortion(section):
+        return np.array([
+            get(section, "k1"),
+            get(section, "k2"),
+            get(section, "p1"),
+            get(section, "p2"),
+            get(section, "k3"),
+        ], dtype=np.float64)
+
+    config.K_l = np.array([[fx_l, 0, cx_l],
+                            [0, fy_l, cy_l],
+                            [0,    0,    1]], dtype=np.float64)
+    config.K_r = np.array([[fx_r, 0, cx_r],
+                            [0, fy_r, cy_r],
+                            [0,    0,    1]], dtype=np.float64)
+    config.D_l = distortion(left_key)
+    config.D_r = distortion(right_key)
+
+    # -- Stereo extrinsics from [STEREO] section ------------------------------
+    stereo = parser["STEREO"]
+    baseline_mm = float(stereo["Baseline"])         # 120.144 mm
+    ty_mm       = float(stereo.get("TY", "0"))      # vertical offset mm
+    tz_mm       = float(stereo.get("TZ", "0"))      # depth offset mm
+
+    # Rotation angles (radians): RX=pitch, CV=yaw/convergence, RZ=roll
+    rx = float(stereo.get(f"RX_{resolution}", "0"))
+    cv = float(stereo.get(f"CV_{resolution}", "0"))
+    rz = float(stereo.get(f"RZ_{resolution}", "0"))
+
+    # Build rotation matrix using Rodrigues (Stereolabs convention: pitch, yaw, roll)
+    R_vec = np.array([rx, cv, rz], dtype=np.float64)
+    config.R, _ = cv2.Rodrigues(R_vec)
+
+    # Translation: [Baseline, TY, TZ] in metres (right camera relative to left)
+    config.T = np.array([
+        [baseline_mm / 1000.0],
+        [ty_mm       / 1000.0],
+        [tz_mm       / 1000.0],
+    ], dtype=np.float64)
+
+    config.baseline = baseline_mm / 1000.0
+
+    # Image size hint for the rectifier intrinsic scaler
+    res_sizes = {"2K": (2208, 1242), "FHD": (1920, 1080),
+                 "HD": (1280, 720),  "VGA": (672, 376)}
+    if resolution in res_sizes:
+        config.calibration_image_size = res_sizes[resolution]
+
+    print(f"[ZED Factory Cal] Loaded {conf_path} at {resolution}")
+    print(f"  Left  fx={fx_l:.3f} fy={fy_l:.3f} cx={cx_l:.3f} cy={cy_l:.3f}")
+    print(f"  Right fx={fx_r:.3f} fy={fy_r:.3f} cx={cx_r:.3f} cy={cy_r:.3f}")
+    print(f"  Baseline={baseline_mm:.3f} mm  RX={rx:.6f}  CV={cv:.6f}  RZ={rz:.6f}")
+    print(f"  Distortion D_l=[{', '.join(f'{v:.6f}' for v in config.D_l)}]")
+    return config
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  DISPLAY HELPERS
@@ -543,17 +606,24 @@ def overlay_info(frame: np.ndarray, pos: Optional[BallPosition],
 def parse_args():
     p = argparse.ArgumentParser(description="Tennis ball 3D detection via ZED stereo")
     p.add_argument("--device",      type=int,   default=0,
-                   help="V4L2 device index (default 0 → /dev/video0)")
+                   help="V4L2 device index (default 0 -> /dev/video0)")
     p.add_argument("--width",       type=int,   default=2560,
                    help="Requested full side-by-side capture width (default 2560)")
     p.add_argument("--height",      type=int,   default=720,
                    help="Requested capture height (default 720)")
     p.add_argument("--fps",         type=float, default=30.0,
                    help="Requested camera frame rate (default 30)")
-    p.add_argument("--fourcc",      type=str,   default=None,
-                   help="Optional four-character pixel format request, such as MJPG")
+    p.add_argument("--fourcc",      type=str,   default="MJPG",
+                   help="Pixel format (default MJPG — avoids green-screen on ZED)")
+    p.add_argument("--zed-calibration", type=str, default=None,
+                   help="Path to Stereolabs factory .conf file (e.g. SN28837104.conf). "
+                        "Enables full rectification without a checkerboard.")
+    p.add_argument("--zed-resolution", type=str, default="HD",
+                   choices=["2K", "FHD", "HD", "VGA"],
+                   help="Resolution key in the .conf file (default HD = 1280x720)")
     p.add_argument("--calibration", type=str,   default=None,
-                   help="Path to .npz calibration file from calibrate_stereo.py")
+                   help="Path to .npz calibration file from calibrate_stereo.py "
+                        "(applied on top of --zed-calibration if both are given)")
     p.add_argument("--no-display",  action="store_true",
                    help="Disable OpenCV window (use for headless SSH sessions)")
     p.add_argument("--log",         type=str,   default=None,
@@ -567,22 +637,22 @@ def parse_args():
 
 def main():
     args = parse_args()
-    if args.width <= 0 or args.height <= 0:
-        raise ValueError("--width and --height must be positive")
-    if args.width % 2 != 0:
-        raise ValueError("--width must be even because the stereo frame is split in half")
-    if args.fps <= 0:
-        raise ValueError("--fps must be positive")
     if args.known_distance is not None and args.known_distance <= 0:
         raise ValueError("--known-distance must be a positive distance in metres")
 
     # ── Setup ──────────────────────────────────────────────────────────────
+    # Priority: factory .conf  ->  checkerboard .npz  ->  hardcoded defaults
+    # The later loader wins on intrinsics; both contribute matrices for rectification.
     config = CameraConfig(
         frame_width=args.width,
         frame_height=args.height,
         fps=args.fps,
         fourcc=args.fourcc,
     )
+    if args.zed_calibration:
+        config = load_zed_factory_calibration(
+            args.zed_calibration, config, resolution=args.zed_resolution
+        )
     if args.calibration:
         config = load_calibration(args.calibration, config)
 
@@ -602,7 +672,8 @@ def main():
     if args.known_distance is not None:
         print(f"[Depth Check] Comparing Z against known distance {args.known_distance:.3f} m")
 
-    while True:
+    try:
+      while True:
         left, right = camera.read()
         if left is None:
             print("[Error] Failed to capture frame.")
@@ -676,12 +747,15 @@ def main():
             # Headless: just run until Ctrl-C
             pass
 
-    # ── Cleanup ─────────────────────────────────────────────────────────────
-    camera.release()
-    cv2.destroyAllWindows()
-    if log_file:
-        log_file.close()
-    print("Done.")
+    except KeyboardInterrupt:
+        print("\n[Interrupted] Shutting down.")
+    finally:
+        # ── Cleanup ──────────────────────────────────────────────────────────
+        camera.release()
+        cv2.destroyAllWindows()
+        if log_file:
+            log_file.close()
+        print("Done.")
 
 
 if __name__ == "__main__":
