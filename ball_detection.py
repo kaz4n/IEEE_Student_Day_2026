@@ -56,13 +56,9 @@ class CameraConfig:
     frame_width:  int = 2560  # Full side-by-side width from USB capture
     frame_height: int = 720   # Full frame height
     fps: float = 30.0
-<<<<<<< HEAD
     fourcc: Optional[str] = "MJPG"
     exposure: Optional[float] = None
     gain: Optional[float] = None
-=======
-    fourcc: Optional[str] = None    
->>>>>>> 7cc1271fe996e1f70229e64318b0953d64801969
 
     # Full stereo calibration. These are required for rectification.
     calibration_image_size: Optional[Tuple[int, int]] = None  # (eye_width, height)
@@ -113,27 +109,6 @@ def fourcc_to_string(value: float) -> str:
     return text if text.strip("\x00") else "unknown"
 
 
-<<<<<<< HEAD
-=======
-def camera_open_error(device_id: int) -> str:
-    if sys.platform.startswith("win"):
-        return (
-            f"Cannot open camera at device {device_id}. "
-            "Check the USB connection and camera permissions."
-        )
-
-    device_path = f"/dev/video{device_id}"
-    return (
-        f"Cannot open camera at device {device_id} ({device_path}). "
-        "Check the USB connection, verify the correct node with "
-        "`v4l2-ctl --list-devices`, inspect formats with "
-        f"`v4l2-ctl -d {device_path} --list-formats-ext`, and make sure your "
-        "user is in the video group with `sudo usermod -aG video \"$USER\"` "
-        "then log out and back in."
-    )
-
-
->>>>>>> 7cc1271fe996e1f70229e64318b0953d64801969
 class ZEDCamera:
     """
     Opens the ZED as a standard USB UVC device and splits each frame into
@@ -153,7 +128,6 @@ class ZEDCamera:
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  config.frame_width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.frame_height)
         self.cap.set(cv2.CAP_PROP_FPS, config.fps)
-<<<<<<< HEAD
         if config.exposure is not None:
             # V4L2 uses 1.0 for manual mode; DirectShow commonly accepts 0.25.
             manual_auto_exposure = 0.25 if sys.platform.startswith("win") else 1.0
@@ -161,10 +135,6 @@ class ZEDCamera:
             self.cap.set(cv2.CAP_PROP_EXPOSURE, config.exposure)
         if config.gain is not None:
             self.cap.set(cv2.CAP_PROP_GAIN, config.gain)
-=======
-        # Disable auto-exposure to keep colour stable
-        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
->>>>>>> 7cc1271fe996e1f70229e64318b0953d64801969
 
         if not self.cap.isOpened():
             raise RuntimeError(camera_open_error(device_id))
@@ -173,17 +143,9 @@ class ZEDCamera:
         actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
         actual_fourcc = fourcc_to_string(self.cap.get(cv2.CAP_PROP_FOURCC))
-<<<<<<< HEAD
         print(f"[ZED] Opened at {actual_w}×{actual_h} "
               f"(eye: {actual_w // 2}×{actual_h}) "
               f"fps={actual_fps:.1f} fourcc={actual_fourcc}")
-=======
-        print(
-            f"[ZED] Opened at {actual_w}×{actual_h} "
-            f"(eye: {actual_w // 2}×{actual_h}) "
-            f"fps={actual_fps:.1f} fourcc={actual_fourcc}"
-        )
->>>>>>> 7cc1271fe996e1f70229e64318b0953d64801969
 
         # Update config to match what the camera actually gave us
         self.cfg.frame_width  = actual_w
@@ -1168,7 +1130,6 @@ def parse_args():
                    help="Requested capture height (default 720)")
     p.add_argument("--fps",         type=float, default=30.0,
                    help="Requested camera frame rate (default 30)")
-<<<<<<< HEAD
     p.add_argument("--fourcc",      type=str,   default="MJPG",
                    help="Pixel format (default MJPG — avoids green-screen on ZED)")
     p.add_argument("--exposure", type=float, default=None,
@@ -1195,10 +1156,6 @@ def parse_args():
     p.add_argument("--zed-resolution", type=str, default="HD",
                    choices=["2K", "FHD", "HD", "VGA"],
                    help="Resolution key in the .conf file (default HD = 1280x720)")
-=======
-    p.add_argument("--fourcc",      type=str,   default=None,
-                   help="Optional four-character pixel format request, such as MJPG")
->>>>>>> 7cc1271fe996e1f70229e64318b0953d64801969
     p.add_argument("--calibration", type=str,   default=None,
                    help="Path to .npz calibration file from calibrate_stereo.py")
     p.add_argument("--no-display",  action="store_true",
