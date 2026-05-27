@@ -10,7 +10,7 @@ The project currently contains three scripts:
 - `calibrate_stereo.py` - stereo checkerboard calibration tool that saves a `calibration.npz` file.
 - `tune_hsv.py` - HSV color tuning utility for finding better tennis-ball color thresholds under local lighting.
 
-The code now supports full stereo calibration handling. If `calibration.npz` includes the stereo matrices saved by `calibrate_stereo.py`, the main detector rectifies the left and right images before using disparity. This is important because raw ZED UVC side-by-side images should not be treated as already rectified.
+The code now starts with the factory ZED 2 calibration for camera serial `SN28837104`, so the main detector can rectify the left and right images without a checkerboard step. If `calibration.npz` includes stereo matrices saved by `calibrate_stereo.py`, that local checkerboard calibration can still be passed as an override.
 
 The current local Python compile check passes:
 
@@ -59,8 +59,11 @@ If the camera negotiates a different resolution, the code reads the actual captu
 
 - Opens the ZED as a normal OpenCV `VideoCapture` device.
 - Splits each frame into left and right eye images.
-- Detects the tennis ball using HSV color masking and Hough circle detection.
-- Loads stereo calibration from `calibration.npz`.
+- Detects a yellow-green tennis ball using HSV color masking and Hough circle detection.
+- Can optionally use a YOLO model for 2-D tennis-ball detection with `--detector yolo`.
+- Smooths valid stereo detections and positions to reduce jitter without holding stale coordinates.
+- Uses hardcoded ZED 2 `SN28837104` factory calibration by default.
+- Can override calibration from a Stereolabs `.conf` file or local `calibration.npz`.
 - Rectifies both camera images before triangulation when full calibration data is available.
 - Validates left/right detections before accepting a 3D result.
 - Computes ball coordinates in metres:
@@ -74,12 +77,12 @@ If the camera negotiates a different resolution, the code reads the actual captu
 
 1. `ball_detection.py` opens the ZED camera and requests a side-by-side stereo frame.
 2. The frame is split into left and right images.
-3. If a full calibration file is provided, both images are undistorted and rectified with OpenCV stereo rectification.
-4. Each rectified image is converted to HSV.
-5. A yellow-green HSV mask isolates likely tennis-ball pixels.
-6. Morphological cleanup and Gaussian blur reduce noise.
-7. Hough circle detection finds candidate circular blobs.
-8. The largest detected circle is selected in each eye.
+3. The built-in ZED 2 factory calibration undistorts and rectifies both images with OpenCV stereo rectification.
+4. The selected detector runs on each rectified eye image.
+5. In default `hsv` mode, a yellow-green HSV mask and Hough circles find the tennis ball.
+6. In optional `yolo` mode, YOLO boxes are converted into `(cx, cy, radius)` detections.
+7. The best candidate is selected in each eye.
+8. Valid stereo detections and positions are smoothed to reduce jitter.
 9. The pair is rejected if:
    - either eye has no detection,
    - the rectified y coordinates differ too much,
@@ -96,7 +99,9 @@ Y = (y_left - cy) * Z / fy
 
 The script also estimates depth from apparent ball size as a rough cross-check.
 
-## Calibration Workflow
+## Optional Checkerboard Calibration Workflow
+
+The default detector already uses the factory calibration for ZED 2 serial `SN28837104`. Run checkerboard calibration only if you want to compare against a local calibration or replace the factory values.
 
 Print or display a checkerboard with known square size. The current default is:
 
@@ -131,7 +136,7 @@ The output is:
 calibration.npz
 ```
 
-Use it with:
+Use it as an override with:
 
 ```bash
 python3 ball_detection.py --device 0 --calibration calibration.npz
@@ -145,28 +150,47 @@ Basic run:
 python3 ball_detection.py --device 0
 ```
 
-Recommended calibrated run:
+Explicit HSV fallback mode:
 
 ```bash
-python3 ball_detection.py --device 0 --calibration calibration.npz
+python3 ball_detection.py --device 0 --detector hsv
+```
+
+Optional YOLO mode:
+
+```bash
+python3 -c "from ultralytics import YOLO; print('ok')"
+python3 ball_detection.py --device 0 --detector yolo --yolo-model best.pt --yolo-class tennis_ball --yolo-imgsz 320
+```
+
+If you use a pretrained COCO model instead of a custom tennis-ball model, use the COCO class name:
+
+```bash
+python3 ball_detection.py --device 0 --detector yolo --yolo-model yolo11n.pt --yolo-class sports_ball
 ```
 
 Headless run over SSH:
 
 ```bash
-python3 ball_detection.py --device 0 --calibration calibration.npz --no-display
+python3 ball_detection.py --device 0 --no-display
+```
+
+Use a Stereolabs `.conf` file instead of the hardcoded default:
+
+```bash
+python3 ball_detection.py --device 0 --zed-calibration SN28837104.conf
 ```
 
 Log detections as JSON lines:
 
 ```bash
-python3 ball_detection.py --device 0 --calibration calibration.npz --log positions.jsonl
+python3 ball_detection.py --device 0 --log positions.jsonl
 ```
 
 Compare computed depth against a measured test distance:
 
 ```bash
-python3 ball_detection.py --device 0 --calibration calibration.npz --known-distance 1.0
+python3 ball_detection.py --device 0 --known-distance 1.0
 ```
 
 Tune the HSV color range:
@@ -180,7 +204,8 @@ Press `s` in the tuner to print updated `HSV_LOWER` and `HSV_UPPER` values, then
 If the Pi cannot keep up at the default capture size, reduce the capture request:
 
 ```bash
-python3 ball_detection.py --device 0 --width 1280 --height 360 --fps 15 --calibration calibration.npz
+python3 ball_detection.py --device 0 --width 1280 --height 360 --fps 15
+python3 ball_detection.py --device 0 --width 1280 --height 360 --fps 15 --detector yolo --yolo-model best.pt --yolo-imgsz 320
 python3 tune_hsv.py --device 0 --width 1280 --height 360 --fps 15 --fourcc MJPG
 ```
 
@@ -198,10 +223,11 @@ All position values are reported in metres.
 
 - HSV color detection is sensitive to lighting, shadows, and backgrounds with similar yellow-green colors.
 - Hough circle detection may fail with motion blur, partial occlusion, or very small/far balls.
-- Accurate coordinates depend heavily on calibration quality.
+- YOLO mode is optional and requires Ultralytics plus a suitable model; it may be slower on Raspberry Pi 5.
+- Accurate coordinates depend heavily on calibration quality and matching the active ZED camera.
 - The Raspberry Pi may need reduced resolution or frame rate for smooth real-time performance.
 - The ZED SDK depth engine is not used; this is an OpenCV stereo geometry approach.
-- If no full calibration is supplied, rectification is disabled and 3D coordinates are less trustworthy.
+- The hardcoded factory calibration is specific to ZED 2 serial `SN28837104`; use `--zed-calibration` or `--calibration` for another camera.
 
 ## Suggested Next Steps
 

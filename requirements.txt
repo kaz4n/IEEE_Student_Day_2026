@@ -1,0 +1,6 @@
+# Core runtime
+numpy>=1.26
+opencv-python>=4.6
+
+# Optional YOLO detector mode: python3 ball_detection.py --detector yolo ...
+ultralytics>=8.0

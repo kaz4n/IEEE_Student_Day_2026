@@ -15,6 +15,8 @@ Requirements:
 
 Usage:
   python3 ball_detection.py
+  python3 ball_detection.py --detector hsv
+  python3 ball_detection.py --detector yolo --yolo-model best.pt
   python3 ball_detection.py --zed-calibration SN28837104.conf
   python3 ball_detection.py --zed-calibration SN28837104.conf --calibration calibration.npz
   python3 ball_detection.py --no-display      (headless / SSH mode)
@@ -56,6 +58,8 @@ class CameraConfig:
     # ── Frame geometry ────────────────────────────────────────────────────────
     frame_width:  int = 2560  # Full side-by-side width from USB capture
     frame_height: int = 720   # Full frame height
+    fps: float = 30.0
+    fourcc: Optional[str] = "MJPG"
 
     # Full stereo calibration. These are required for rectification.
     calibration_image_size: Optional[Tuple[int, int]] = None  # (eye_width, height)
@@ -78,6 +82,70 @@ class CameraConfig:
         )
 
 
+def create_zed2_sn28837104_config(
+    frame_width: int = 2560,
+    frame_height: int = 720,
+    fps: float = 30.0,
+    fourcc: Optional[str] = "MJPG",
+    verbose: bool = True,
+) -> CameraConfig:
+    """Return hardcoded ZED 2 SN28837104 factory calibration for HD mode."""
+    fx_l, fy_l, cx_l, cy_l = 532.935, 532.470, 642.825, 368.3685
+    fx_r, fy_r, cx_r, cy_r = 531.920, 531.910, 648.270, 364.320
+    baseline_mm = 120.144
+    ty_mm = -0.0708224
+    tz_mm = -0.0801476
+    rx = 0.00161995
+    cv = -0.00199086
+    rz = 0.000540406
+
+    config = CameraConfig(
+        fx=fx_l,
+        fy=fy_l,
+        cx=cx_l,
+        cy=cy_l,
+        baseline=baseline_mm / 1000.0,
+        frame_width=frame_width,
+        frame_height=frame_height,
+        fps=fps,
+        fourcc=fourcc,
+        calibration_image_size=(1280, 720),
+        K_l=np.array([[fx_l, 0, cx_l],
+                      [0, fy_l, cy_l],
+                      [0,    0,    1]], dtype=np.float64),
+        D_l=np.array([
+            -0.0644799,
+            0.0414727,
+            2.32191e-05,
+            0.000663395,
+            -0.0160775,
+        ], dtype=np.float64),
+        K_r=np.array([[fx_r, 0, cx_r],
+                      [0, fy_r, cy_r],
+                      [0,    0,    1]], dtype=np.float64),
+        D_r=np.array([
+            -0.0648757,
+            0.0410955,
+            -0.000163562,
+            -0.000147387,
+            -0.0159065,
+        ], dtype=np.float64),
+        T=np.array([
+            [baseline_mm / 1000.0],
+            [ty_mm / 1000.0],
+            [tz_mm / 1000.0],
+        ], dtype=np.float64),
+    )
+    config.R, _ = cv2.Rodrigues(np.array([rx, cv, rz], dtype=np.float64))
+
+    if verbose:
+        print("[ZED Factory Cal] Using hardcoded ZED 2 SN28837104 HD factory calibration")
+        print(f"  Left  fx={fx_l:.3f} fy={fy_l:.3f} cx={cx_l:.3f} cy={cy_l:.3f}")
+        print(f"  Right fx={fx_r:.3f} fy={fy_r:.3f} cx={cx_r:.3f} cy={cy_r:.3f}")
+        print(f"  Baseline={baseline_mm:.3f} mm  RX={rx:.6f}  CV={cv:.6f}  RZ={rz:.6f}")
+    return config
+
+
 # ── Tennis ball HSV colour range ──────────────────────────────────────────────
 # Tennis balls are yellow-green; tweak if lighting differs significantly.
 HSV_LOWER = np.array([22,  80,  80])
@@ -97,6 +165,31 @@ MAX_EPIPOLAR_Y_DIFF_PX = 4.0
 #  CAMERA LAYER
 # ══════════════════════════════════════════════════════════════════════════════
 
+def fourcc_to_string(value: float) -> str:
+    code = int(value)
+    chars = [chr((code >> 8 * i) & 0xFF) for i in range(4)]
+    text = "".join(chars)
+    return text if text.strip("\x00") else "unknown"
+
+
+def camera_open_error(device_id: int) -> str:
+    if sys.platform.startswith("win"):
+        return (
+            f"Cannot open camera at device {device_id}. "
+            "Check the USB connection and camera permissions."
+        )
+
+    device_path = f"/dev/video{device_id}"
+    return (
+        f"Cannot open camera at device {device_id} ({device_path}). "
+        "Check the USB connection, verify the correct node with "
+        "`v4l2-ctl --list-devices`, inspect formats with "
+        f"`v4l2-ctl -d {device_path} --list-formats-ext`, and make sure your "
+        "user is in the video group with `sudo usermod -aG video \"$USER\"` "
+        "then log out and back in."
+    )
+
+
 class ZEDCamera:
     """
     Opens the ZED as a standard USB UVC device and splits each frame into
@@ -108,22 +201,29 @@ class ZEDCamera:
         backend = cv2.CAP_DSHOW if sys.platform.startswith("win") else cv2.CAP_V4L2
         self.cap = cv2.VideoCapture(device_id, backend)
 
+        if config.fourcc:
+            fourcc = config.fourcc.upper()
+            if len(fourcc) != 4:
+                raise ValueError("--fourcc must be exactly four characters, such as MJPG")
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  config.frame_width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.frame_height)
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
+        self.cap.set(cv2.CAP_PROP_FPS, config.fps)
         # Disable auto-exposure to keep colour stable
         self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
 
         if not self.cap.isOpened():
-            raise RuntimeError(
-                f"Cannot open camera at device {device_id}. "
-                "Check USB connection and camera permissions."
-            )
+            raise RuntimeError(camera_open_error(device_id))
 
         actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        print(f"[ZED] Opened at {actual_w}×{actual_h} "
-              f"(eye: {actual_w // 2}×{actual_h})")
+        actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        actual_fourcc = fourcc_to_string(self.cap.get(cv2.CAP_PROP_FOURCC))
+        print(
+            f"[ZED] Opened at {actual_w}×{actual_h} "
+            f"(eye: {actual_w // 2}×{actual_h}) "
+            f"fps={actual_fps:.1f} fourcc={actual_fourcc}"
+        )
 
         # Update config to match what the camera actually gave us
         self.cfg.frame_width  = actual_w
@@ -204,6 +304,143 @@ class TennisBallDetector:
             cv2.putText(frame, text, (cx + r + 5, cy),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, circle_color, 2)
         return frame
+
+
+class YOLOTennisBallDetector:
+    """
+    Optional Ultralytics YOLO detector. Returns the same (cx, cy, radius)
+    tuple as TennisBallDetector so the stereo geometry stays unchanged.
+    """
+
+    def __init__(self, model_path: str, class_name: str,
+                 confidence: float = 0.35, image_size: int = 320):
+        if not model_path:
+            raise ValueError("--yolo-model is required when using --detector yolo")
+
+        try:
+            from ultralytics import YOLO
+        except ImportError as exc:
+            raise RuntimeError(
+                "Ultralytics YOLO is not installed. Install it before using "
+                "--detector yolo, or use the default --detector hsv mode."
+            ) from exc
+
+        self.model = YOLO(model_path)
+        self.confidence = confidence
+        self.image_size = image_size
+        self.target_class_id = self._resolve_class_id(class_name)
+
+    def _resolve_class_id(self, class_name: str) -> Optional[int]:
+        if class_name is None or class_name.strip().lower() in ("", "any", "all"):
+            return None
+        if class_name.isdigit():
+            return int(class_name)
+
+        wanted = self._normalise_name(class_name)
+        names = self.model.names
+        if isinstance(names, dict):
+            items = names.items()
+        else:
+            items = enumerate(names)
+
+        for class_id, name in items:
+            if self._normalise_name(str(name)) == wanted:
+                return int(class_id)
+
+        available = ", ".join(str(name) for _, name in items) if isinstance(names, dict) else ", ".join(map(str, names))
+        raise ValueError(f"YOLO class '{class_name}' was not found. Available classes: {available}")
+
+    @staticmethod
+    def _normalise_name(name: str) -> str:
+        return name.strip().lower().replace(" ", "_").replace("-", "_")
+
+    def detect(self, bgr_frame: np.ndarray) -> Detection:
+        results = self.model.predict(
+            bgr_frame,
+            imgsz=self.image_size,
+            conf=self.confidence,
+            verbose=False,
+        )
+        if not results:
+            return None
+
+        boxes = results[0].boxes
+        if boxes is None or len(boxes) == 0:
+            return None
+
+        best = None
+        best_conf = -1.0
+        for box in boxes:
+            cls_id = int(box.cls[0])
+            if self.target_class_id is not None and cls_id != self.target_class_id:
+                continue
+
+            conf = float(box.conf[0])
+            if conf < best_conf:
+                continue
+
+            x1, y1, x2, y2 = [float(v) for v in box.xyxy[0]]
+            w = max(x2 - x1, 1.0)
+            h = max(y2 - y1, 1.0)
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            radius = max(w, h) / 2.0
+
+            best_conf = conf
+            best = (int(round(cx)), int(round(cy)), int(round(radius)))
+
+        return best
+
+    @staticmethod
+    def annotate(frame: np.ndarray, det: Detection,
+                 circle_color=(0, 255, 0), text: str = "") -> np.ndarray:
+        return TennisBallDetector.annotate(frame, det, circle_color, text)
+
+
+class StereoDetectionSmoother:
+    """EMA smoothing for valid stereo detections only; reset on invalid/lost pairs."""
+
+    def __init__(self, alpha: float):
+        self.alpha = alpha
+        self.left = None
+        self.right = None
+
+    def reset(self):
+        self.left = None
+        self.right = None
+
+    def _smooth_one(self, previous, current):
+        if previous is None:
+            return tuple(float(v) for v in current)
+        return tuple(
+            self.alpha * float(cur) + (1.0 - self.alpha) * float(prev)
+            for prev, cur in zip(previous, current)
+        )
+
+    def update(self, left: Detection, right: Detection) -> Tuple[Detection, Detection]:
+        self.left = self._smooth_one(self.left, left)
+        self.right = self._smooth_one(self.right, right)
+        return self._to_detection(self.left), self._to_detection(self.right)
+
+    @staticmethod
+    def _to_detection(values) -> Detection:
+        if values is None:
+            return None
+        cx, cy, r = values
+        return int(round(cx)), int(round(cy)), int(round(r))
+
+
+def create_detector(args):
+    if args.detector == "hsv":
+        return TennisBallDetector()
+    if args.detector == "yolo":
+        return YOLOTennisBallDetector(
+            model_path=args.yolo_model,
+            class_name=args.yolo_class,
+            confidence=args.yolo_conf,
+            image_size=args.yolo_imgsz,
+        )
+    raise ValueError(f"Unknown detector mode: {args.detector}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -356,6 +593,40 @@ class BallPosition:
             record["depth_error"] = round(self.depth_error, 4)
             record["depth_error_pct"] = round(self.depth_error_pct, 2)
         return record
+
+
+class PositionSmoother:
+    """EMA smoothing for valid 3-D positions only; reset on invalid/lost pairs."""
+
+    def __init__(self, alpha: float):
+        self.alpha = alpha
+        self.position = None
+
+    def reset(self):
+        self.position = None
+
+    def update(self, current: BallPosition) -> BallPosition:
+        if self.position is None:
+            self.position = current
+            return current
+
+        prev = self.position
+        a = self.alpha
+        smoothed = BallPosition(
+            X=a * current.X + (1.0 - a) * prev.X,
+            Y=a * current.Y + (1.0 - a) * prev.Y,
+            Z=a * current.Z + (1.0 - a) * prev.Z,
+            disparity=a * current.disparity + (1.0 - a) * prev.disparity,
+            size_Z=a * current.size_Z + (1.0 - a) * prev.size_Z,
+            epipolar_y_diff=current.epipolar_y_diff,
+            known_Z=current.known_Z,
+        )
+        if current.depth_error is not None and current.depth_error_pct is not None:
+            smoothed.depth_error = smoothed.Z - current.known_Z
+            smoothed.depth_error_pct = (smoothed.depth_error / current.known_Z) * 100.0
+
+        self.position = smoothed
+        return smoothed
 
 
 class StereoTriangulator:
@@ -632,22 +903,47 @@ def parse_args():
                    help="Known measured ball distance in metres for depth-error checks")
     p.add_argument("--max-epipolar-y-diff", type=float, default=MAX_EPIPOLAR_Y_DIFF_PX,
                    help="Reject left/right matches with larger rectified y difference")
+    p.add_argument("--detector", choices=("hsv", "yolo"), default="hsv",
+                   help="Detector backend: hsv is lightweight fallback, yolo is optional")
+    p.add_argument("--yolo-model", type=str, default=None,
+                   help="Path/name of YOLO model for --detector yolo, such as best.pt")
+    p.add_argument("--yolo-conf", type=float, default=0.35,
+                   help="YOLO confidence threshold (default 0.35)")
+    p.add_argument("--yolo-class", type=str, default="tennis_ball",
+                   help="YOLO class name or id to use (default tennis_ball)")
+    p.add_argument("--yolo-imgsz", type=int, default=320,
+                   help="YOLO inference image size (default 320)")
+    p.add_argument("--smooth-alpha", type=float, default=0.35,
+                   help="EMA smoothing factor for valid detections/positions (0..1, default 0.35)")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.width <= 0 or args.height <= 0:
+        raise ValueError("--width and --height must be positive")
+    if args.width % 2 != 0:
+        raise ValueError("--width must be even because the stereo frame is split in half")
+    if args.fps <= 0:
+        raise ValueError("--fps must be positive")
+    if not 0.0 <= args.yolo_conf <= 1.0:
+        raise ValueError("--yolo-conf must be between 0 and 1")
+    if args.yolo_imgsz <= 0:
+        raise ValueError("--yolo-imgsz must be positive")
+    if not 0.0 <= args.smooth_alpha <= 1.0:
+        raise ValueError("--smooth-alpha must be between 0 and 1")
     if args.known_distance is not None and args.known_distance <= 0:
         raise ValueError("--known-distance must be a positive distance in metres")
 
     # ── Setup ──────────────────────────────────────────────────────────────
-    # Priority: factory .conf  ->  checkerboard .npz  ->  hardcoded defaults
-    # The later loader wins on intrinsics; both contribute matrices for rectification.
-    config = CameraConfig(
+    # Priority: hardcoded ZED 2 factory defaults -> optional factory .conf
+    # override -> optional checkerboard .npz override.
+    config = create_zed2_sn28837104_config(
         frame_width=args.width,
         frame_height=args.height,
         fps=args.fps,
         fourcc=args.fourcc,
+        verbose=not args.zed_calibration,
     )
     if args.zed_calibration:
         config = load_zed_factory_calibration(
@@ -656,10 +952,15 @@ def main():
     if args.calibration:
         config = load_calibration(args.calibration, config)
 
+    try:
+        detector = create_detector(args)
+    except (RuntimeError, ValueError) as exc:
+        raise SystemExit(f"[Detector] {exc}") from None
     camera       = ZEDCamera(device_id=args.device, config=config)
     rectifier    = StereoRectifier(camera.cfg)
-    detector     = TennisBallDetector()
     triangulator = StereoTriangulator(config=camera.cfg)  # use updated config
+    detection_smoother = StereoDetectionSmoother(args.smooth_alpha)
+    position_smoother = PositionSmoother(args.smooth_alpha)
 
     log_file = open(args.log, "a") if args.log else None
 
@@ -668,7 +969,8 @@ def main():
     t_fps      = time.time()
     frame_idx  = 0
 
-    print("\n[Ready] Press 'q' to quit, 's' to save current frame.\n")
+    print(f"\n[Ready] detector={args.detector} smooth_alpha={args.smooth_alpha:.2f}")
+    print("Press 'q' to quit, 's' to save current frame.\n")
     if args.known_distance is not None:
         print(f"[Depth Check] Comparing Z against known distance {args.known_distance:.3f} m")
 
@@ -683,17 +985,33 @@ def main():
         left, right = rectifier.rectify(left, right)
 
         # ── Detect ──────────────────────────────────────────────────────
-        left_det  = detector.detect(left)
-        right_det = detector.detect(right)
+        left_raw_det  = detector.detect(left)
+        right_raw_det = detector.detect(right)
 
         pair_ok, status_message = validate_stereo_pair(
-            left_det,
-            right_det,
+            left_raw_det,
+            right_raw_det,
             max_y_diff=args.max_epipolar_y_diff,
         )
 
+        left_det = None
+        right_det = None
+        if pair_ok:
+            left_det, right_det = detection_smoother.update(left_raw_det, right_raw_det)
+            pair_ok, status_message = validate_stereo_pair(
+                left_det,
+                right_det,
+                max_y_diff=args.max_epipolar_y_diff,
+            )
+            if not pair_ok:
+                detection_smoother.reset()
+                position_smoother.reset()
+        else:
+            detection_smoother.reset()
+            position_smoother.reset()
+
         # ── Triangulate ─────────────────────────────────────────────────
-        position = (
+        raw_position = (
             triangulator.triangulate(
                 left_det,
                 right_det,
@@ -701,6 +1019,7 @@ def main():
             )
             if pair_ok else None
         )
+        position = position_smoother.update(raw_position) if raw_position else None
 
         # ── Log / print ─────────────────────────────────────────────────
         if position:
@@ -727,6 +1046,8 @@ def main():
         # ── Display ─────────────────────────────────────────────────────
         if not args.no_display:
             # Annotate each eye
+            detector.annotate(left,  left_raw_det,  circle_color=(120, 120, 120), text="raw L")
+            detector.annotate(right, right_raw_det, circle_color=(120, 120, 120), text="raw R")
             detector.annotate(left,  left_det,  circle_color=(0, 255, 0),   text="L")
             detector.annotate(right, right_det, circle_color=(0, 200, 255), text="R")
 
