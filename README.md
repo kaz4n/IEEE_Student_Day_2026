@@ -59,9 +59,10 @@ If the camera negotiates a different resolution, the code reads the actual captu
 
 - Opens the ZED as a normal OpenCV `VideoCapture` device.
 - Splits each frame into left and right eye images.
-- Detects a yellow-green tennis ball using HSV color masking and Hough circle detection.
-- Can optionally use a YOLO model for 2-D tennis-ball detection with `--detector yolo`.
-- Smooths valid stereo detections and positions to reduce jitter without holding stale coordinates.
+- Detects a yellow-green tennis ball using HSV color masking, contour blobs, and Hough circle fallback.
+- Can optionally use a YOLO model for tracked 2-D tennis-ball detection with `--detector yolo`.
+- Scores multiple left/right candidates before triangulation so the stereo pair is more stable.
+- Smooths valid stereo detections and positions to reduce jitter, with a short display-only reacquisition hold.
 - Uses hardcoded ZED 2 `SN28837104` factory calibration by default.
 - Can override calibration from a Stereolabs `.conf` file or local `calibration.npz`.
 - Rectifies both camera images before triangulation when full calibration data is available.
@@ -79,10 +80,10 @@ If the camera negotiates a different resolution, the code reads the actual captu
 2. The frame is split into left and right images.
 3. The built-in ZED 2 factory calibration undistorts and rectifies both images with OpenCV stereo rectification.
 4. The selected detector runs on each rectified eye image.
-5. In default `hsv` mode, a yellow-green HSV mask and Hough circles find the tennis ball.
-6. In optional `yolo` mode, YOLO boxes are converted into `(cx, cy, radius)` detections.
-7. The best candidate is selected in each eye.
-8. Valid stereo detections and positions are smoothed to reduce jitter.
+5. In default `hsv` mode, a yellow-green HSV mask finds contour blobs first, then falls back to Hough circles.
+6. In optional `yolo` mode, YOLO tracking boxes are converted into `(cx, cy, radius)` candidates.
+7. Multiple left/right candidates are matched with the stereo validation rules, preferring the pair closest to the last valid ball.
+8. Valid stereo detections and positions are smoothed to reduce jitter; brief losses show a hold/reacquire marker but do not print or log stale 3D coordinates.
 9. The pair is rejected if:
    - either eye has no detection,
    - the rectified y coordinates differ too much,
@@ -106,7 +107,7 @@ The default detector already uses the factory calibration for ZED 2 serial `SN28
 Print or display a checkerboard with known square size. The current default is:
 
 - 9 by 6 inner corners.
-- 25 mm square size.
+- 18 mm square size.
 - At least 15 valid stereo captures.
 
 Run:
@@ -160,13 +161,13 @@ Optional YOLO mode:
 
 ```bash
 python3 -c "from ultralytics import YOLO; print('ok')"
-python3 ball_detection.py --device 0 --detector yolo --yolo-model best.pt --yolo-class tennis_ball --yolo-imgsz 320
+python3 ball_detection.py --device 0 --detector yolo --yolo-model yolo11n.pt --yolo-class sports_ball --yolo-imgsz 640 --yolo-conf 0.20
 ```
 
-If you use a pretrained COCO model instead of a custom tennis-ball model, use the COCO class name:
+If you train or download a custom tennis-ball model, point to the real file path:
 
 ```bash
-python3 ball_detection.py --device 0 --detector yolo --yolo-model yolo11n.pt --yolo-class sports_ball
+python3 ball_detection.py --device 0 --detector yolo --yolo-model runs/detect/train/weights/best.pt --yolo-class tennis_ball --yolo-imgsz 640 --yolo-conf 0.20
 ```
 
 Headless run over SSH:
@@ -205,8 +206,14 @@ If the Pi cannot keep up at the default capture size, reduce the capture request
 
 ```bash
 python3 ball_detection.py --device 0 --width 1280 --height 360 --fps 15
-python3 ball_detection.py --device 0 --width 1280 --height 360 --fps 15 --detector yolo --yolo-model best.pt --yolo-imgsz 320
+python3 ball_detection.py --device 0 --width 1280 --height 360 --fps 15 --detector yolo --yolo-model yolo11n.pt --yolo-class sports_ball --yolo-imgsz 480 --yolo-conf 0.20
 python3 tune_hsv.py --device 0 --width 1280 --height 360 --fps 15 --fourcc MJPG
+```
+
+YOLO mode uses Ultralytics tracking by default. If the tracker causes trouble, disable it and use per-frame detection:
+
+```bash
+python3 ball_detection.py --device 0 --detector yolo --yolo-model yolo11n.pt --yolo-class sports_ball --no-yolo-track
 ```
 
 ## Coordinate Frame
@@ -222,8 +229,8 @@ All position values are reported in metres.
 ## Current Limitations
 
 - HSV color detection is sensitive to lighting, shadows, and backgrounds with similar yellow-green colors.
-- Hough circle detection may fail with motion blur, partial occlusion, or very small/far balls.
-- YOLO mode is optional and requires Ultralytics plus a suitable model; it may be slower on Raspberry Pi 5.
+- HSV detection may still fail with motion blur, partial occlusion, or very small/far balls.
+- YOLO mode is optional and requires Ultralytics plus a suitable model; `--yolo-imgsz 640` is better for far balls but may be slower on Raspberry Pi 5.
 - Accurate coordinates depend heavily on calibration quality and matching the active ZED camera.
 - The Raspberry Pi may need reduced resolution or frame rate for smooth real-time performance.
 - The ZED SDK depth engine is not used; this is an OpenCV stereo geometry approach.
@@ -235,5 +242,5 @@ All position values are reported in metres.
 - Record error statistics from `--known-distance` runs.
 - Tune HSV thresholds in the actual competition lighting.
 - Add frame-rate measurements on the Raspberry Pi.
-- Consider contour-based detection or tracking if Hough circles are unstable.
+- Train a custom tennis-ball YOLO model if COCO `sports_ball` misses your patterned ball at longer distances.
 - Add saved sample frames for repeatable offline testing.

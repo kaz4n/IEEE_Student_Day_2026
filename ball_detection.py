@@ -2,8 +2,8 @@
 Tennis Ball 3D Detection — ZED Stereo Camera on Raspberry Pi
 ============================================================
 Uses the ZED as a standard USB stereo camera (no ZED SDK / CUDA needed).
-Detects tennis ball via HSV color filtering + Hough circles in both eyes,
-then triangulates to get real-world (X, Y, Z) coordinates in meters.
+Detects a tennis ball via HSV colour filtering or optional YOLO tracking in
+both eyes, then triangulates to get real-world (X, Y, Z) coordinates in meters.
 
 Coordinate frame (camera-centered):
   +X → right
@@ -16,7 +16,7 @@ Requirements:
 Usage:
   python3 ball_detection.py
   python3 ball_detection.py --detector hsv
-  python3 ball_detection.py --detector yolo --yolo-model best.pt
+  python3 ball_detection.py --detector yolo --yolo-model yolo11n.pt --yolo-class sports_ball
   python3 ball_detection.py --zed-calibration SN28837104.conf
   python3 ball_detection.py --zed-calibration SN28837104.conf --calibration calibration.npz
   python3 ball_detection.py --no-display      (headless / SSH mode)
@@ -29,9 +29,10 @@ import configparser
 import time
 import json
 import sys
+import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -251,6 +252,36 @@ class ZEDCamera:
 Detection = Optional[Tuple[int, int, int]]   # (cx_px, cy_px, radius_px)
 
 
+@dataclass
+class DetectionCandidate:
+    """Internal detector result with metadata used before stereo triangulation."""
+    cx: float
+    cy: float
+    radius: float
+    confidence: float = 1.0
+    class_id: Optional[int] = None
+    class_name: Optional[str] = None
+    track_id: Optional[int] = None
+    source: str = ""
+
+    def as_detection(self) -> Tuple[int, int, int]:
+        return (
+            int(round(self.cx)),
+            int(round(self.cy)),
+            max(1, int(round(self.radius))),
+        )
+
+
+@dataclass
+class StereoPairSelection:
+    left: Detection
+    right: Detection
+    pair_ok: bool
+    status: str
+    hold_left: Detection = None
+    hold_right: Detection = None
+
+
 class TennisBallDetector:
     """
     Detects a single tennis ball in a BGR image using:
@@ -262,19 +293,66 @@ class TennisBallDetector:
     """
 
     def __init__(self):
-        self._morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        self._open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        self._close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
 
-    def detect(self, bgr_frame: np.ndarray) -> Detection:
+    def _tennis_mask(self, bgr_frame: np.ndarray) -> np.ndarray:
         hsv  = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, HSV_LOWER, HSV_UPPER)
 
-        # Clean up small holes and salt-and-pepper noise
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  self._morph_kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._morph_kernel)
-        mask = cv2.GaussianBlur(mask, (9, 9), 2)
+        # Patterned balls often have black/white seams that punch holes in the
+        # colour mask, so close gaps more aggressively before fitting circles.
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  self._open_kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._close_kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._close_kernel)
+        return mask
+
+    def detect_candidates(self, bgr_frame: np.ndarray,
+                          stream_id: Optional[str] = None) -> List[DetectionCandidate]:
+        mask = self._tennis_mask(bgr_frame)
+        candidates: List[DetectionCandidate] = []
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        min_area = max(20.0, math.pi * (MIN_RADIUS_PX ** 2) * 0.18)
+        for contour in contours:
+            area = float(cv2.contourArea(contour))
+            if area < min_area:
+                continue
+
+            perimeter = float(cv2.arcLength(contour, True))
+            if perimeter <= 0:
+                continue
+
+            (cx, cy), radius = cv2.minEnclosingCircle(contour)
+            if radius < MIN_RADIUS_PX or radius > MAX_RADIUS_PX:
+                continue
+
+            circle_area = math.pi * radius * radius
+            fill_ratio = area / max(circle_area, 1.0)
+            circularity = (4.0 * math.pi * area) / max(perimeter * perimeter, 1.0)
+            if circularity < 0.35 or fill_ratio < 0.18:
+                continue
+
+            size_score = min(1.0, radius / 40.0)
+            confidence = min(
+                1.0,
+                0.55 * min(circularity, 1.0) +
+                0.35 * min(fill_ratio, 1.0) +
+                0.10 * size_score,
+            )
+            candidates.append(DetectionCandidate(
+                cx=float(cx),
+                cy=float(cy),
+                radius=float(radius),
+                confidence=confidence,
+                class_name="tennis_ball",
+                source="hsv_contour",
+            ))
+
+        blurred = cv2.GaussianBlur(mask, (9, 9), 2)
 
         circles = cv2.HoughCircles(
-            mask,
+            blurred,
             cv2.HOUGH_GRADIENT,
             dp=1.2,
             minDist=40,
@@ -284,13 +362,29 @@ class TennisBallDetector:
             maxRadius=MAX_RADIUS_PX,
         )
 
-        if circles is None:
-            return None
+        if circles is not None:
+            for cx, cy, r in np.round(circles[0]).astype(int):
+                if any(math.hypot(cx - c.cx, cy - c.cy) < max(5.0, r * 0.35)
+                       for c in candidates):
+                    continue
+                candidates.append(DetectionCandidate(
+                    cx=float(cx),
+                    cy=float(cy),
+                    radius=float(r),
+                    confidence=min(0.90, 0.45 + (float(r) / MAX_RADIUS_PX) * 0.45),
+                    class_name="tennis_ball",
+                    source="hsv_hough",
+                ))
 
-        # Pick the largest circle (most likely the real ball, not glare)
-        circles = np.round(circles[0]).astype(int)
-        cx, cy, r = max(circles, key=lambda c: c[2])
-        return int(cx), int(cy), int(r)
+        candidates.sort(
+            key=lambda c: (c.confidence, c.radius),
+            reverse=True,
+        )
+        return candidates
+
+    def detect(self, bgr_frame: np.ndarray) -> Detection:
+        candidates = self.detect_candidates(bgr_frame)
+        return candidates[0].as_detection() if candidates else None
 
     @staticmethod
     def annotate(frame: np.ndarray, det: Detection,
@@ -313,9 +407,12 @@ class YOLOTennisBallDetector:
     """
 
     def __init__(self, model_path: str, class_name: str,
-                 confidence: float = 0.35, image_size: int = 320):
+                 confidence: float = 0.20, image_size: int = 640,
+                 use_tracking: bool = True, tracker: str = "bytetrack.yaml"):
         if not model_path:
             raise ValueError("--yolo-model is required when using --detector yolo")
+
+        self._validate_model_path(model_path)
 
         try:
             from ultralytics import YOLO
@@ -325,10 +422,38 @@ class YOLOTennisBallDetector:
                 "--detector yolo, or use the default --detector hsv mode."
             ) from exc
 
+        self._YOLO = YOLO
+        self.model_path = model_path
         self.model = YOLO(model_path)
+        self._models = {"left": self.model}
         self.confidence = confidence
         self.image_size = image_size
+        self.use_tracking = use_tracking
+        self.tracker = tracker
+        self._tracking_failed = False
+        self._tracking_warning_printed = False
         self.target_class_id = self._resolve_class_id(class_name)
+
+    @staticmethod
+    def _validate_model_path(model_path: str):
+        known_auto_models = {
+            "yolo11n.pt", "yolo11s.pt", "yolo11m.pt", "yolo11l.pt", "yolo11x.pt",
+            "yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov8l.pt", "yolov8x.pt",
+        }
+        path = Path(model_path)
+        looks_local = (
+            path.parent != Path(".")
+            or model_path.startswith(".")
+            or model_path.startswith("/")
+            or model_path not in known_auto_models
+        )
+        if model_path.endswith(".pt") and looks_local and not path.exists():
+            raise ValueError(
+                f"YOLO model file not found: {model_path}. "
+                "Use a pretrained Ultralytics model such as `--yolo-model yolo11n.pt "
+                "--yolo-class sports_ball`, or copy/train your custom model and pass "
+                "its real path, for example `--yolo-model runs/detect/train/weights/best.pt`."
+            )
 
     def _resolve_class_id(self, class_name: str) -> Optional[int]:
         if class_name is None or class_name.strip().lower() in ("", "any", "all"):
@@ -339,46 +464,77 @@ class YOLOTennisBallDetector:
         wanted = self._normalise_name(class_name)
         names = self.model.names
         if isinstance(names, dict):
-            items = names.items()
+            items = list(names.items())
         else:
-            items = enumerate(names)
+            items = list(enumerate(names))
 
         for class_id, name in items:
             if self._normalise_name(str(name)) == wanted:
                 return int(class_id)
 
-        available = ", ".join(str(name) for _, name in items) if isinstance(names, dict) else ", ".join(map(str, names))
+        available = ", ".join(str(name) for _, name in items)
         raise ValueError(f"YOLO class '{class_name}' was not found. Available classes: {available}")
 
     @staticmethod
     def _normalise_name(name: str) -> str:
         return name.strip().lower().replace(" ", "_").replace("-", "_")
 
-    def detect(self, bgr_frame: np.ndarray) -> Detection:
-        results = self.model.predict(
+    def _model_for_stream(self, stream_id: Optional[str]):
+        if not self.use_tracking or self._tracking_failed:
+            return self.model
+
+        key = stream_id or "left"
+        if key not in self._models:
+            self._models[key] = self._YOLO(self.model_path)
+        return self._models[key]
+
+    def _run_model(self, bgr_frame: np.ndarray, stream_id: Optional[str]):
+        model = self._model_for_stream(stream_id)
+        if self.use_tracking and not self._tracking_failed:
+            try:
+                return model.track(
+                    bgr_frame,
+                    imgsz=self.image_size,
+                    conf=self.confidence,
+                    persist=True,
+                    tracker=self.tracker,
+                    verbose=False,
+                )
+            except Exception as exc:
+                self._tracking_failed = True
+                if not self._tracking_warning_printed:
+                    print(
+                        "[YOLO] Tracking unavailable; falling back to per-frame "
+                        f"detection. Reason: {exc}"
+                    )
+                    self._tracking_warning_printed = True
+
+        return model.predict(
             bgr_frame,
             imgsz=self.image_size,
             conf=self.confidence,
             verbose=False,
         )
+
+    def detect_candidates(self, bgr_frame: np.ndarray,
+                          stream_id: Optional[str] = None) -> List[DetectionCandidate]:
+        results = self._run_model(bgr_frame, stream_id)
         if not results:
-            return None
+            return []
 
         boxes = results[0].boxes
         if boxes is None or len(boxes) == 0:
-            return None
+            return []
 
-        best = None
-        best_conf = -1.0
-        for box in boxes:
+        candidates: List[DetectionCandidate] = []
+        track_ids = getattr(boxes, "id", None)
+        names = self.model.names
+        for idx, box in enumerate(boxes):
             cls_id = int(box.cls[0])
             if self.target_class_id is not None and cls_id != self.target_class_id:
                 continue
 
             conf = float(box.conf[0])
-            if conf < best_conf:
-                continue
-
             x1, y1, x2, y2 = [float(v) for v in box.xyxy[0]]
             w = max(x2 - x1, 1.0)
             h = max(y2 - y1, 1.0)
@@ -386,10 +542,36 @@ class YOLOTennisBallDetector:
             cy = (y1 + y2) / 2.0
             radius = max(w, h) / 2.0
 
-            best_conf = conf
-            best = (int(round(cx)), int(round(cy)), int(round(radius)))
+            track_id = None
+            if track_ids is not None:
+                try:
+                    track_id = int(track_ids[idx].item())
+                except (AttributeError, TypeError, ValueError, IndexError):
+                    track_id = None
 
-        return best
+            class_name = None
+            if isinstance(names, dict):
+                class_name = str(names.get(cls_id, cls_id))
+            elif 0 <= cls_id < len(names):
+                class_name = str(names[cls_id])
+
+            candidates.append(DetectionCandidate(
+                cx=cx,
+                cy=cy,
+                radius=radius,
+                confidence=conf,
+                class_id=cls_id,
+                class_name=class_name,
+                track_id=track_id,
+                source="yolo_track" if track_id is not None else "yolo",
+            ))
+
+        candidates.sort(key=lambda c: c.confidence, reverse=True)
+        return candidates
+
+    def detect(self, bgr_frame: np.ndarray) -> Detection:
+        candidates = self.detect_candidates(bgr_frame)
+        return candidates[0].as_detection() if candidates else None
 
     @staticmethod
     def annotate(frame: np.ndarray, det: Detection,
@@ -430,6 +612,119 @@ class StereoDetectionSmoother:
         return int(round(cx)), int(round(cy)), int(round(r))
 
 
+class StereoCandidateMatcher:
+    """
+    Chooses the most plausible left/right ball pair from detector candidates.
+    A short memory helps reacquire the same moving ball without outputting
+    stale 3-D coordinates during detection loss.
+    """
+
+    def __init__(self, hold_frames: int = 6):
+        self.hold_frames = hold_frames
+        self.last_left: Detection = None
+        self.last_right: Detection = None
+        self.lost_frames = 0
+
+    def reset(self):
+        self.last_left = None
+        self.last_right = None
+        self.lost_frames = 0
+
+    def select(self,
+               left_candidates: Sequence[DetectionCandidate],
+               right_candidates: Sequence[DetectionCandidate],
+               max_y_diff: float) -> StereoPairSelection:
+        if not left_candidates or not right_candidates:
+            missing = []
+            if not left_candidates:
+                missing.append("LEFT")
+            if not right_candidates:
+                missing.append("RIGHT")
+            return self._lost("Ball not detected in " + " ".join(missing))
+
+        best = None
+        best_score = -1e9
+        last_reject = "Rejected pair: no valid stereo candidate"
+
+        for left in left_candidates:
+            left_det = left.as_detection()
+            for right in right_candidates:
+                right_det = right.as_detection()
+                pair_ok, reason = validate_stereo_pair(
+                    left_det,
+                    right_det,
+                    max_y_diff=max_y_diff,
+                )
+                if not pair_ok:
+                    last_reject = reason
+                    continue
+
+                score = self._score_pair(left, right, left_det, right_det, max_y_diff)
+                if score > best_score:
+                    best_score = score
+                    best = (left_det, right_det)
+
+        if best is None:
+            return self._lost(last_reject)
+
+        self.last_left, self.last_right = best
+        self.lost_frames = 0
+        return StereoPairSelection(
+            left=self.last_left,
+            right=self.last_right,
+            pair_ok=True,
+            status="OK",
+        )
+
+    def _score_pair(self, left: DetectionCandidate, right: DetectionCandidate,
+                    left_det: Tuple[int, int, int],
+                    right_det: Tuple[int, int, int],
+                    max_y_diff: float) -> float:
+        xl, yl, rl = left_det
+        xr, yr, rr = right_det
+        y_diff = abs(float(yl - yr))
+        radius_ratio = min(rl, rr) / max(rl, rr)
+
+        score = left.confidence + right.confidence
+        score += 0.25 * radius_ratio
+        score -= 0.10 * (y_diff / max(max_y_diff, 1.0))
+
+        if self.last_left is not None and self.last_right is not None:
+            lpx, lpy, lpr = self.last_left
+            rpx, rpy, rpr = self.last_right
+            motion = math.hypot(xl - lpx, yl - lpy) + math.hypot(xr - rpx, yr - rpy)
+            avg_radius = max((rl + rr + lpr + rpr) / 4.0, 1.0)
+            score -= min(2.0, motion / (avg_radius * 8.0))
+
+        return score
+
+    def _lost(self, status: str) -> StereoPairSelection:
+        self.lost_frames += 1
+        hold_left = None
+        hold_right = None
+        if (
+            self.hold_frames > 0
+            and self.last_left is not None
+            and self.last_right is not None
+            and self.lost_frames <= self.hold_frames
+        ):
+            hold_left = self.last_left
+            hold_right = self.last_right
+            status = f"Reacquiring ({self.lost_frames}/{self.hold_frames}): {status}"
+        elif self.lost_frames > self.hold_frames:
+            self.last_left = None
+            self.last_right = None
+
+        return StereoPairSelection(
+            left=None,
+            right=None,
+            pair_ok=False,
+            status=status,
+            hold_left=hold_left,
+            hold_right=hold_right,
+        )
+
+
 def create_detector(args):
     if args.detector == "hsv":
         return TennisBallDetector()
@@ -439,6 +734,8 @@ def create_detector(args):
             class_name=args.yolo_class,
             confidence=args.yolo_conf,
             image_size=args.yolo_imgsz,
+            use_tracking=not args.no_yolo_track,
+            tracker=args.yolo_tracker,
         )
     raise ValueError(f"Unknown detector mode: {args.detector}")
 
@@ -907,14 +1204,20 @@ def parse_args():
                    help="Detector backend: hsv is lightweight fallback, yolo is optional")
     p.add_argument("--yolo-model", type=str, default=None,
                    help="Path/name of YOLO model for --detector yolo, such as best.pt")
-    p.add_argument("--yolo-conf", type=float, default=0.35,
-                   help="YOLO confidence threshold (default 0.35)")
-    p.add_argument("--yolo-class", type=str, default="tennis_ball",
-                   help="YOLO class name or id to use (default tennis_ball)")
-    p.add_argument("--yolo-imgsz", type=int, default=320,
-                   help="YOLO inference image size (default 320)")
+    p.add_argument("--yolo-conf", type=float, default=0.20,
+                   help="YOLO confidence threshold (default 0.20)")
+    p.add_argument("--yolo-class", type=str, default="sports_ball",
+                   help="YOLO class name or id to use (default sports_ball)")
+    p.add_argument("--yolo-imgsz", type=int, default=640,
+                   help="YOLO inference image size (default 640)")
+    p.add_argument("--no-yolo-track", action="store_true",
+                   help="Disable Ultralytics tracking and use per-frame YOLO prediction")
+    p.add_argument("--yolo-tracker", type=str, default="bytetrack.yaml",
+                   help="Ultralytics tracker config for YOLO mode (default bytetrack.yaml)")
     p.add_argument("--smooth-alpha", type=float, default=0.35,
                    help="EMA smoothing factor for valid detections/positions (0..1, default 0.35)")
+    p.add_argument("--track-hold-frames", type=int, default=6,
+                   help="Frames to show last detection while reacquiring; no stale 3-D output (default 6)")
     return p.parse_args()
 
 
@@ -932,8 +1235,15 @@ def main():
         raise ValueError("--yolo-imgsz must be positive")
     if not 0.0 <= args.smooth_alpha <= 1.0:
         raise ValueError("--smooth-alpha must be between 0 and 1")
+    if args.track_hold_frames < 0:
+        raise ValueError("--track-hold-frames must be zero or greater")
     if args.known_distance is not None and args.known_distance <= 0:
         raise ValueError("--known-distance must be a positive distance in metres")
+
+    try:
+        detector = create_detector(args)
+    except (RuntimeError, ValueError) as exc:
+        raise SystemExit(f"[Detector] {exc}") from None
 
     # ── Setup ──────────────────────────────────────────────────────────────
     # Priority: hardcoded ZED 2 factory defaults -> optional factory .conf
@@ -952,15 +1262,12 @@ def main():
     if args.calibration:
         config = load_calibration(args.calibration, config)
 
-    try:
-        detector = create_detector(args)
-    except (RuntimeError, ValueError) as exc:
-        raise SystemExit(f"[Detector] {exc}") from None
     camera       = ZEDCamera(device_id=args.device, config=config)
     rectifier    = StereoRectifier(camera.cfg)
     triangulator = StereoTriangulator(config=camera.cfg)  # use updated config
     detection_smoother = StereoDetectionSmoother(args.smooth_alpha)
     position_smoother = PositionSmoother(args.smooth_alpha)
+    stereo_matcher = StereoCandidateMatcher(args.track_hold_frames)
 
     log_file = open(args.log, "a") if args.log else None
 
@@ -969,7 +1276,10 @@ def main():
     t_fps      = time.time()
     frame_idx  = 0
 
-    print(f"\n[Ready] detector={args.detector} smooth_alpha={args.smooth_alpha:.2f}")
+    print(
+        f"\n[Ready] detector={args.detector} smooth_alpha={args.smooth_alpha:.2f} "
+        f"hold_frames={args.track_hold_frames}"
+    )
     print("Press 'q' to quit, 's' to save current frame.\n")
     if args.known_distance is not None:
         print(f"[Depth Check] Comparing Z against known distance {args.known_distance:.3f} m")
@@ -985,14 +1295,18 @@ def main():
         left, right = rectifier.rectify(left, right)
 
         # ── Detect ──────────────────────────────────────────────────────
-        left_raw_det  = detector.detect(left)
-        right_raw_det = detector.detect(right)
+        left_candidates = detector.detect_candidates(left, stream_id="left")
+        right_candidates = detector.detect_candidates(right, stream_id="right")
 
-        pair_ok, status_message = validate_stereo_pair(
-            left_raw_det,
-            right_raw_det,
+        selection = stereo_matcher.select(
+            left_candidates,
+            right_candidates,
             max_y_diff=args.max_epipolar_y_diff,
         )
+        left_raw_det = selection.left
+        right_raw_det = selection.right
+        pair_ok = selection.pair_ok
+        status_message = selection.status
 
         left_det = None
         right_det = None
@@ -1048,6 +1362,9 @@ def main():
             # Annotate each eye
             detector.annotate(left,  left_raw_det,  circle_color=(120, 120, 120), text="raw L")
             detector.annotate(right, right_raw_det, circle_color=(120, 120, 120), text="raw R")
+            if not pair_ok:
+                detector.annotate(left,  selection.hold_left,  circle_color=(255, 180, 0), text="hold L")
+                detector.annotate(right, selection.hold_right, circle_color=(255, 180, 0), text="hold R")
             detector.annotate(left,  left_det,  circle_color=(0, 255, 0),   text="L")
             detector.annotate(right, right_det, circle_color=(0, 200, 255), text="R")
 

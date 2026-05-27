@@ -29,7 +29,7 @@ from typing import Optional
 # Inner corners (columns - 1, rows - 1) of your printed checkerboard
 BOARD_W       = 9       # number of inner corners along width
 BOARD_H       = 6       # number of inner corners along height
-SQUARE_SIZE_M = 0.025   # physical square size in metres (25 mm)
+SQUARE_SIZE_M = 0.018   # physical square size in metres (18 mm)
 MIN_CAPTURES  = 15      # minimum good captures before calibration is allowed
 OUTPUT_FILE   = "calibration.npz"
 
