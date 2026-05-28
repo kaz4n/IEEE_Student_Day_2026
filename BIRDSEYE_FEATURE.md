@@ -151,8 +151,9 @@ Two windows will open side by side:
 
 ### Demo mode — no camera needed
 
-Runs a simulated ball rolling across the arena so you can test the view
-on any computer without connecting the ZED:
+Runs a simulated ball rolling across the arena so you can test the drawing code
+on any computer without connecting the ZED. This mode does **not** read camera
+or detector output, so it will always show a fake motion path:
 
 ```bash
 python3 birdseye.py --demo
@@ -161,6 +162,32 @@ python3 birdseye.py --demo
 Controls in demo mode:
 - `q` — quit
 - `r` — reset ball to starting position with a random angle
+
+### Standalone live viewer from detector logs
+
+If you want to run `birdseye.py` as a separate process, feed it the JSONL log
+written by `ball_detection.py`:
+
+```bash
+python3 ball_detection.py \
+    --zed-calibration SN28837104.conf \
+    --log positions.jsonl \
+    --no-display
+```
+
+Then in another terminal:
+
+```bash
+python3 birdseye.py --follow-log positions.jsonl
+```
+
+The recommended live mode is still direct integration:
+
+```bash
+python3 ball_detection.py \
+    --zed-calibration SN28837104.conf \
+    --birdseye
+```
 
 ### Headless mode — no display, over SSH
 

@@ -6,9 +6,11 @@ renders an overhead X/Z map. The vertical Y axis is intentionally ignored.
 """
 
 import argparse
+import json
 import math
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import cv2
@@ -326,11 +328,11 @@ class BirdsEyeOverlay:
             return None
         return traj.intercept_x
 
-    def update(self, position) -> np.ndarray:
+    def update(self, position, timestamp: Optional[float] = None) -> np.ndarray:
         if position is None:
             self.tracker.update(None, None)
         else:
-            self.tracker.update(position.X, position.Z)
+            self.tracker.update(position.X, position.Z, timestamp=timestamp)
         self.frame = self.renderer.render(self.tracker)
         return self.frame
 
@@ -341,9 +343,98 @@ class _DemoPosition:
         self.Z = z
 
 
-def run_demo():
-    overlay = BirdsEyeOverlay()
+def _position_from_record(record: dict) -> Tuple[Optional[_DemoPosition], Optional[float]]:
+    source = record.get("position", record)
+    if not isinstance(source, dict):
+        return None, None
+
+    x = source.get("X", source.get("x"))
+    z = source.get("Z", source.get("z"))
+    if x is None or z is None:
+        return None, None
+
+    timestamp = record.get("t", source.get("t"))
+    try:
+        timestamp = float(timestamp) if timestamp is not None else None
+        return _DemoPosition(float(x), float(z)), timestamp
+    except (TypeError, ValueError):
+        return None, None
+
+
+def _read_jsonl_position(line: str) -> Tuple[Optional[_DemoPosition], Optional[float]]:
+    line = line.strip()
+    if not line:
+        return None, None
+    try:
+        record = json.loads(line)
+    except json.JSONDecodeError:
+        return None, None
+    return _position_from_record(record)
+
+
+def _show_overlay_frame(overlay: BirdsEyeOverlay, window_title: str,
+                        wait_ms: int = 30) -> int:
+    cv2.imshow(window_title, overlay.frame)
+    return cv2.waitKey(wait_ms) & 0xFF
+
+
+def run_log_follow(path: str, replay: bool = False, intercept_z: float = INTERCEPT_Z_M,
+                   arena_x_m: float = 4.0, arena_z_m: float = 4.0,
+                   stale_timeout_s: float = 0.75):
+    log_path = Path(path)
+    overlay = BirdsEyeOverlay(
+        arena_x_m=arena_x_m,
+        arena_z_m=arena_z_m,
+        intercept_z=intercept_z,
+    )
+    window_title = "Bird's Eye View - live log"
+    print(f"[Bird's Eye] Reading real positions from {log_path}")
+    print("[Bird's Eye] Press 'q' to quit.")
+
+    while not log_path.exists():
+        key = _show_overlay_frame(overlay, window_title, wait_ms=100)
+        if key == ord("q"):
+            cv2.destroyAllWindows()
+            return
+        print(f"[Bird's Eye] Waiting for log file: {log_path}")
+        time.sleep(0.5)
+
+    with log_path.open("r", encoding="utf-8") as file:
+        if not replay:
+            file.seek(0, 2)
+
+        last_update = time.monotonic()
+        while True:
+            line = file.readline()
+            if line:
+                position, timestamp = _read_jsonl_position(line)
+                if position is not None:
+                    overlay.update(position, timestamp=timestamp)
+                    last_update = time.monotonic()
+            else:
+                if replay:
+                    break
+                if time.monotonic() - last_update > stale_timeout_s:
+                    overlay.update(None)
+                    last_update = time.monotonic()
+                time.sleep(0.03)
+
+            key = _show_overlay_frame(overlay, window_title, wait_ms=1)
+            if key == ord("q"):
+                break
+
+    cv2.destroyAllWindows()
+
+
+def run_demo(intercept_z: float = INTERCEPT_Z_M,
+             arena_x_m: float = 4.0, arena_z_m: float = 4.0):
+    overlay = BirdsEyeOverlay(
+        arena_x_m=arena_x_m,
+        arena_z_m=arena_z_m,
+        intercept_z=intercept_z,
+    )
     t0 = time.monotonic()
+    print("[Bird's Eye Demo] SIMULATED path only. It does not read the camera.")
     print("[Bird's Eye Demo] Press 'q' to quit, 'r' to reset.")
     offset_x = -0.8
     speed_x = 0.18
@@ -358,7 +449,10 @@ def run_demo():
             t0 = time.monotonic()
             continue
         frame = overlay.update(_DemoPosition(x, z))
-        cv2.imshow("Bird's Eye View", frame)
+        cv2.putText(frame, "SIMULATED DEMO - no camera input", (92, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (80, 180, 255), 1)
+        overlay.frame = frame
+        cv2.imshow("Bird's Eye View - demo", overlay.frame)
         key = cv2.waitKey(30) & 0xFF
         if key == ord("q"):
             break
@@ -369,18 +463,58 @@ def run_demo():
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Bird's eye view overlay demo")
-    parser.add_argument("--demo", action="store_true",
-                        help="Run a simulated rolling-ball demo")
+    parser = argparse.ArgumentParser(description="Bird's eye view overlay")
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--demo", action="store_true",
+                        help="Run a simulated rolling-ball demo; does not read the camera")
+    source.add_argument("--follow-log", type=str, default=None,
+                        help="Follow a JSONL log produced by ball_detection.py --log")
+    source.add_argument("--replay-log", type=str, default=None,
+                        help="Replay positions from an existing JSONL log")
+    parser.add_argument("--intercept-z", type=float, default=INTERCEPT_Z_M,
+                        help="Z distance in metres where panel intercept is predicted")
+    parser.add_argument("--arena-x", type=float, default=4.0,
+                        help="Arena width shown in metres")
+    parser.add_argument("--arena-z", type=float, default=4.0,
+                        help="Arena depth shown in metres")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.intercept_z <= 0:
+        raise ValueError("--intercept-z must be positive")
+    if args.arena_x <= 0 or args.arena_z <= 0:
+        raise ValueError("--arena-x and --arena-z must be positive")
+
     if args.demo:
-        run_demo()
+        run_demo(
+            intercept_z=args.intercept_z,
+            arena_x_m=args.arena_x,
+            arena_z_m=args.arena_z,
+        )
+    elif args.follow_log:
+        run_log_follow(
+            args.follow_log,
+            replay=False,
+            intercept_z=args.intercept_z,
+            arena_x_m=args.arena_x,
+            arena_z_m=args.arena_z,
+        )
+    elif args.replay_log:
+        run_log_follow(
+            args.replay_log,
+            replay=True,
+            intercept_z=args.intercept_z,
+            arena_x_m=args.arena_x,
+            arena_z_m=args.arena_z,
+        )
     else:
-        print("Run with --demo, or import BirdsEyeOverlay from ball_detection.py.")
+        print("No live data source selected.")
+        print("For real camera data, run: python ball_detection.py --birdseye")
+        print("For a separate viewer, run ball_detection.py with --log positions.jsonl,")
+        print("then run: python birdseye.py --follow-log positions.jsonl")
+        print("For fake motion only, run: python birdseye.py --demo")
 
 
 if __name__ == "__main__":

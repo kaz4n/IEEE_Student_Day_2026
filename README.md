@@ -196,6 +196,9 @@ Run with the bird's eye tracking window:
 python3 ball_detection.py --device 0 --birdseye
 ```
 
+This is the recommended live mode. The bird's eye view is updated from the
+actual `BallPosition` values computed inside `ball_detection.py`.
+
 Run bird's eye tracking in headless mode. The overlay window is skipped, but
 `intercept_x` is still computed and printed when valid:
 
@@ -213,6 +216,20 @@ Test the bird's eye view without the ZED camera:
 
 ```bash
 python3 birdseye.py --demo
+```
+
+`--demo` is simulated and will always show a fake rolling ball. It is only for
+checking the drawing code. To view real detector output in a separate window,
+run the detector with logging in one terminal:
+
+```bash
+python3 ball_detection.py --device 0 --log positions.jsonl --no-display
+```
+
+Then follow that log in another terminal:
+
+```bash
+python3 birdseye.py --follow-log positions.jsonl
 ```
 
 Use a Stereolabs `.conf` file instead of the hardcoded default:
