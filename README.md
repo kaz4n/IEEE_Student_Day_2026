@@ -190,6 +190,31 @@ Headless run over SSH:
 python3 ball_detection.py --device 0 --no-display
 ```
 
+Run with the bird's eye tracking window:
+
+```bash
+python3 ball_detection.py --device 0 --birdseye
+```
+
+Run bird's eye tracking in headless mode. The overlay window is skipped, but
+`intercept_x` is still computed and printed when valid:
+
+```bash
+python3 ball_detection.py --device 0 --birdseye --no-display
+```
+
+Change the panel intercept plane if the physical panel is not at `Z=0.30 m`:
+
+```bash
+python3 ball_detection.py --device 0 --birdseye --intercept-z 0.40
+```
+
+Test the bird's eye view without the ZED camera:
+
+```bash
+python3 birdseye.py --demo
+```
+
 Use a Stereolabs `.conf` file instead of the hardcoded default:
 
 ```bash

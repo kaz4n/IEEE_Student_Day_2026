@@ -30,6 +30,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
+try:
+    from birdseye import BirdsEyeOverlay
+    _BIRDSEYE_AVAILABLE = True
+    _BIRDSEYE_IMPORT_ERROR = None
+except ImportError as exc:
+    BirdsEyeOverlay = None
+    _BIRDSEYE_AVAILABLE = False
+    _BIRDSEYE_IMPORT_ERROR = exc
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONFIGURATION
@@ -1123,7 +1132,7 @@ def overlay_info(frame: np.ndarray, pos: Optional[BallPosition],
 def parse_args():
     p = argparse.ArgumentParser(description="Tennis ball 3D detection via ZED stereo")
     p.add_argument("--device",      type=int,   default=0,
-                   help="V4L2 device index (default 0 → /dev/video0)")
+                   help="V4L2 device index (default 0 -> /dev/video0)")
     p.add_argument("--width",       type=int,   default=2560,
                    help="Requested full side-by-side capture width (default 2560)")
     p.add_argument("--height",      type=int,   default=720,
@@ -1131,7 +1140,7 @@ def parse_args():
     p.add_argument("--fps",         type=float, default=30.0,
                    help="Requested camera frame rate (default 30)")
     p.add_argument("--fourcc",      type=str,   default="MJPG",
-                   help="Pixel format (default MJPG — avoids green-screen on ZED)")
+                   help="Pixel format (default MJPG; avoids green-screen on ZED)")
     p.add_argument("--exposure", type=float, default=None,
                    help="Optional manual camera exposure value. Lower values reduce motion blur.")
     p.add_argument("--gain", type=float, default=None,
@@ -1160,6 +1169,10 @@ def parse_args():
                    help="Path to .npz calibration file from calibrate_stereo.py")
     p.add_argument("--no-display",  action="store_true",
                    help="Disable OpenCV window (use for headless SSH sessions)")
+    p.add_argument("--birdseye", action="store_true",
+                   help="Show bird's eye 2D tracking view")
+    p.add_argument("--intercept-z", type=float, default=0.30,
+                   help="Z distance in metres where panel intercept is predicted")
     p.add_argument("--log",         type=str,   default=None,
                    help="Append JSON position records to this file")
     p.add_argument("--known-distance", type=float, default=None,
@@ -1187,6 +1200,8 @@ def main():
         raise ValueError("--model-input-size must be positive")
     if args.max_track_misses < 0:
         raise ValueError("--max-track-misses must be non-negative")
+    if args.intercept_z <= 0:
+        raise ValueError("--intercept-z must be positive")
 
     # ── Setup ──────────────────────────────────────────────────────────────
     config = CameraConfig(
@@ -1213,6 +1228,18 @@ def main():
     right_tracker = ImageBallTracker(max_missed=args.max_track_misses)
     position_tracker = PositionTracker3D(max_missed=args.max_track_misses)
     triangulator = StereoTriangulator(config=camera.cfg)  # use updated config
+
+    bev = None
+    if args.birdseye:
+        if _BIRDSEYE_AVAILABLE:
+            bev = BirdsEyeOverlay(
+                arena_x_m=4.0,
+                arena_z_m=4.0,
+                intercept_z=args.intercept_z,
+            )
+            print("[Bird's Eye] Enabled.")
+        else:
+            print(f"[Bird's Eye] birdseye.py not available: {_BIRDSEYE_IMPORT_ERROR}")
 
     log_file = open(args.log, "a") if args.log else None
 
@@ -1281,6 +1308,13 @@ def main():
             if position is not None:
                 status_message = "TRACKED 3d-tracker prediction through detector miss"
 
+        # ── Bird's eye view / intercept ─────────────────────────────────
+        if bev is not None:
+            bev.update(position)
+            ix = bev.intercept_x
+            if ix is not None and position is not None and frame_idx % 10 == 0:
+                print(f"  -> Panel intercept X={ix:+.3f} m")
+
         # ── Log / print ─────────────────────────────────────────────────
         if position:
             print(f"[Frame {frame_idx:05d}] {position}")
@@ -1321,6 +1355,8 @@ def main():
             overlay_info(combined, position, fps, status_message)
 
             cv2.imshow("ZED Ball Detection", combined)
+            if bev is not None:
+                cv2.imshow("Bird's Eye View", bev.frame)
             if args.debug_mask and left_mask is not None and right_mask is not None:
                 mask_h = min(left_mask.shape[0], right_mask.shape[0])
                 mask_l = left_mask[:mask_h]
